@@ -1400,21 +1400,6 @@ static VALUE connection_execute_with_returning(int argc, VALUE *argv, VALUE self
  * and committed.  Otherwise, the statement executes within the context of the
  * current transaction.
  */
-/* call-seq:
- *   query(:array, sql, *arg) -> Array of Arrays or nil
- *   query(:hash, sql, *arg) -> Array of Hashes or nil
- *   query(sql, *args) -> Array of Arrays or nil
- *
- * For queries returning a result set, an array is returned, containing
- * either a list of Arrays or Hashes, one for each row.
- *
- * If the sql statement performs an INSERT, UPDATE or DELETE, the number of rows
- * affected is returned.  Other statements, such as schema updates, return -1.
- *
- * If no transaction is currently active, a transaction is automatically started
- * and committed.  Otherwise, the statement executes within the context of the
- * current transaction.
- */
 static VALUE connection_query(int argc, VALUE *argv, VALUE self)
 {
 	VALUE format;
@@ -2660,16 +2645,6 @@ cleanup:
     return rb_ary_new(); // En caso de error, devolver array vacío
 }
 
-/* call-seq:
- *   execute(sql, *args) -> nil or rows affected
- *
- * This function is no longer published.
- */
-/* call-seq:
- *   execute(sql, *args) -> nil or rows affected or Array of Hashes or Cursor
- *
- * This function is no longer published.
- */
 /* call-seq:
  *   execute(sql, *args) -> nil or rows affected or Array of Hashes or Cursor
  *
