@@ -1,0 +1,9 @@
+
+*.swp
+*.gem
+*.so
+*.o
+*.log
+Makefile
+tags
+fb.bundle

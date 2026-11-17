@@ -245,4 +245,46 @@ class CursorTestCases < FbTestCase
       end
     end
   end
+
+  # Un SELECT con mas de SQLDA_COLSINIT (50) columnas obliga a reasignar el SQLDA
+  # de salida. La cache de sentencias se quedaba con el puntero al SQLDA viejo
+  # (ya liberado), asi que a partir de la SEGUNDA ejecucion del mismo SQL se leia
+  # memoria liberada: `query` devolvia 0 en lugar de las filas (o el proceso se
+  # caia con doble free / SIGSEGV).
+  # Se repite el mismo SQL a proposito (las ejecuciones siguientes vienen de la
+  # cache). Con 1000 columnas y 10 vueltas el fallo se ve de forma segura: la
+  # segunda vuelta ya devuelve 0 en lugar de las filas.
+  # Ademas, al final se ejecuta un DDL (DROP TABLE): la invalidacion de la cache
+  # hace DSQL_drop de la sentencia cacheada y Firebird escribe NULL, no solo en la
+  # variable que se le pasa, sino tambien en la direccion del campo stmt que se le
+  # dio al prepararla (la del cursor dueno). Si ese cursor ya lo habia liberado el
+  # GC y Ruby habia reciclado su memoria para otro cursor, el handle del nuevo
+  # quedaba a cero -> "invalid statement handle". Por eso el dueno queda anclado
+  # (fb_stmt_cache_destroy) hasta destruir la entrada.
+  def test_more_than_50_columns_repeated_query
+    columns = 1000
+    runs = 10
+    definitions = (1..columns).map { |i| "C#{i} INTEGER" }.join(', ')
+    names = (1..columns).map { |i| "C#{i}" }.join(', ')
+    values = (1..columns).map { |i| i.to_s }.join(', ')
+    sql_select = "SELECT * FROM TEST_WIDE"
+    expected = (1..columns).to_a
+
+    Database.create(@parms) do |connection|
+      connection.execute("CREATE TABLE TEST_WIDE (#{definitions})")
+      connection.execute("INSERT INTO TEST_WIDE (#{names}) VALUES (#{values})")
+      connection.commit
+
+      runs.times do |run|
+        rows = connection.query(sql_select)
+        assert_instance_of Array, rows, "run #{run}"
+        assert_equal 1, rows.size, "run #{run}"
+        assert_equal columns, rows.first.size, "run #{run}"
+        assert_equal expected, rows.first, "run #{run}"
+      end
+
+      connection.execute("DROP TABLE TEST_WIDE")
+      connection.drop
+    end
+  end
 end

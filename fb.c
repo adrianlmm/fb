@@ -1,4 +1,4 @@
-/*
+ /*
   * fb.c
   * A module to access the Firebird database from Ruby.
   * Fork of interbase.c to fb.c by Brent Rowland.
@@ -43,21 +43,43 @@
 #include <time.h>
 #include <stdbool.h>
 
-/* Add definitions for Firebird 4.0+ time zone types if not present */
-#ifndef SQL_TIMESTAMP_WITH_TZ
-#define SQL_TIMESTAMP_WITH_TZ 32754
-typedef struct
-{
-	ISC_TIMESTAMP timestamp;
-	unsigned short time_zone;
-} ISC_TIMESTAMP_WITH_TZ;
+#if defined(HAVE_FB_CANCEL_OPERATION) && defined(HAVE_RB_THREAD_CALL_WITHOUT_GVL)
+#  include <ruby/thread.h>
 #endif
 
-#ifndef SQL_TIME_WITH_TZ
-#define SQL_TIME_WITH_TZ 32756
-typedef ISC_TIMESTAMP_WITH_TZ ISC_TIME_WITH_TZ;
+/* Firebird 4+ batch API (IBatch) ------------------------------------------
+ * Permite ejecutar un array de tuplas con un solo round trip en lugar de un
+ * isc_dsql_execute2 por registro. Solo se compila si extconf.rb la encuentra
+ * (headers + simbolos en libfbclient); si no, fb.c usa el loop de siempre. */
+#if defined(HAVE_FIREBIRD_FB_C_API_H) && defined(HAVE_FB_GET_MASTER_INTERFACE) && \
+    defined(HAVE_FB_GET_STATEMENT_INTERFACE) && defined(HAVE_FB_GET_TRANSACTION_INTERFACE)
+#  define FB_HAVE_BATCH_API 1
+#  include <firebird/fb_c_api.h>
+/* fb_c_api.h declara los tipos como "struct IXxx" (esta pensado para C++):
+   estos typedefs hacen que los nombres cortos y sus macros sean C valido. */
+typedef struct IMaster IMaster;
+typedef struct IStatus IStatus;
+typedef struct IUtil IUtil;
+typedef struct IStatement IStatement;
+typedef struct ITransaction ITransaction;
+typedef struct IMessageMetadata IMessageMetadata;
+typedef struct IBatch IBatch;
+typedef struct IBatchCompletionState IBatchCompletionState;
+typedef struct IXpbBuilder IXpbBuilder;
 #endif
 
+/* SQL type constants for Firebird 4.0/5.0+ not present in older ibase.h */
+#ifndef SQL_TIMESTAMP_TZ
+#define SQL_TIMESTAMP_TZ_EX              32748
+#define SQL_TIME_TZ_EX                   32750
+#define SQL_INT128                       32752
+#define SQL_TIMESTAMP_TZ                 32754
+#define SQL_TIME_TZ                      32756
+#define SQL_DEC16                        32760
+#define SQL_DEC34                        32762
+#define SQL_BOOLEAN                      32764
+#define SQL_NULL                         32766
+#endif
 
 #define	SQLDA_COLSINIT	50
 #define	SQLCODE_NOMORE	100
@@ -65,6 +87,15 @@ typedef ISC_TIMESTAMP_WITH_TZ ISC_TIME_WITH_TZ;
 #define	CMND_DELIMIT	" \t\n\r\f"
 #define	LIST_DELIMIT	", \t\n\r\f"
 #define	META_NAME_MAX	31
+
+/* Tamano maximo de un segmento de blob.
+   isc_put_segment recibe la longitud en un unsigned short (65535 seria el
+   tope de la biblioteca), pero los servidores Firebird 2.5 y anteriores solo
+   manejan segmentos de 32765 bytes: 32765 es el mayor valor que funciona con
+   cualquier version, y de todos modos son 8 veces menos segmentos (y menos
+   isc_put_segment/isc_get_segment, cada uno con su ida y vuelta) que los 4096
+   de antes. */
+#define	FB_BLOB_SEGMENT_SIZE	32765
 
 /* Statement type */
 #define	STATEMENT_DDL	1
@@ -86,17 +117,6 @@ static VALUE rb_sFbIndex;
 static VALUE rb_sFbColumn;
 static VALUE rb_cDate;
 
-static VALUE cursor_close _((VALUE));
-static VALUE cursor_drop _((VALUE));
-static VALUE cursor_execute _((int, VALUE*, VALUE));
-static VALUE cursor_fetchall _((int, VALUE*, VALUE));
-static VALUE cursor_fetch _((int, VALUE*, VALUE));
-static VALUE cursor_fields _((int, VALUE*, VALUE));
-static VALUE cursor_each _((int, VALUE*, VALUE)); // AÑADIDO: Declaración movida aquí
-static VALUE sql_decimal_to_bigdecimal(long long sql_data, int scale);
-static VALUE cursor_execute2_returning(VALUE);
-static VALUE fb_hash_from_ary(VALUE, VALUE);
-
 static ID id_matches;
 static ID id_downcase_bang;
 static VALUE re_lowercase;
@@ -112,6 +132,19 @@ static char isc_tpb_0[] = {
 };
 
 /* structs */
+
+/* Entrada de cache de sentencias preparadas (ver fb_stmt_cache_*) */
+struct FbStmtCache {
+	char *sql;
+	isc_stmt_handle stmt;
+	XSQLDA *i_sqlda;
+	XSQLDA *o_sqlda;
+	long statement_type;
+	int in_use;
+	int invalid;
+	VALUE owner;	/* cursor en cuyo campo stmt vive el handle (ver fb_stmt_cache_destroy) */
+	struct FbStmtCache *next;
+};
 
 /* DB handle and TR parameter block list structure */
 typedef struct
@@ -132,10 +165,13 @@ struct FbConnection {
 	isc_db_handle db;		/* DB handle */
 	isc_tr_handle transact; /* transaction handle */
 	VALUE cursor;
+	VALUE cached_cursors; /* anclaje GC de cursores con sentencia cacheada */
 	unsigned short dialect;
 	unsigned short db_dialect;
 	short downcase_names;
 	VALUE encoding;
+	long command_timeout_ms;	/* 0 = sin limite */
+	struct FbStmtCache *stmt_cache;
 	int dropped;
 	ISC_STATUS isc_status[20];
 	/* struct FbConnection *next; */
@@ -157,6 +193,9 @@ struct FbCursor {
 	VALUE fields_ary;
 	VALUE fields_hash;
 	VALUE connection;
+	struct FbStmtCache *cache;	/* entrada de cache (o NULL si es dueno) */
+	int exec_procedure;
+	int fetched;
 };
 
 typedef struct trans_opts
@@ -284,20 +323,6 @@ static VALUE fb_mkdate(struct tm *tm)
 		INT2FIX(1900 + tm->tm_year), INT2FIX(tm->tm_mon + 1), INT2FIX(tm->tm_mday));
 }
 
-static VALUE fb_mktime_with_offset(struct tm *tm, int offset_minutes)
-{
-	VALUE time_val = rb_funcall(
-		rb_cTime, rb_intern("new"), 7,
-		INT2FIX(tm->tm_year + 1900), INT2FIX(tm->tm_mon + 1), INT2FIX(tm->tm_mday),
-		INT2FIX(tm->tm_hour), INT2FIX(tm->tm_min), INT2FIX(tm->tm_sec),
-		INT2FIX(offset_minutes * 60)
-	);
-	if (offset_minutes == 0) {
-		return rb_funcall(time_val, rb_intern("utc"), 0);
-	}
-	return time_val;
-}
-
 static int responds_like_date(VALUE obj)
 {
 	return rb_respond_to(obj, rb_intern("year")) &&
@@ -389,6 +414,39 @@ static VALUE double_from_obj(VALUE obj)
 	return obj;
 }
 
+/* INT128 (Firebird 4+): se maneja como Integer de Ruby (bignum) almacenado en
+   16 bytes little-endian en complemento a dos. Sin esto, los valores fuera del
+   rango de int64 daban RangeError al escribir y se truncaban al leer. */
+static VALUE fb_int128_modulus;	/* 2**128 */
+static VALUE fb_int128_lomask;	/* 2**64 - 1 */
+
+static void fb_int128_write(char *dest, VALUE v)
+{
+	VALUE mod = rb_funcall(v, rb_intern("%"), 1, fb_int128_modulus);	/* complemento a dos */
+	VALUE lo = rb_funcall(mod, rb_intern("&"), 1, fb_int128_lomask);
+	VALUE hi = rb_funcall(mod, rb_intern(">>"), 1, INT2FIX(64));
+	unsigned long long lo64 = NUM2ULL(lo);
+	unsigned long long hi64 = NUM2ULL(hi);
+
+	memcpy(dest, &lo64, sizeof(lo64));
+	memcpy(dest + sizeof(lo64), &hi64, sizeof(hi64));
+}
+
+static VALUE fb_int128_read(const char *src)
+{
+	unsigned long long lo64, hi64;
+	VALUE v;
+
+	memcpy(&lo64, src, sizeof(lo64));
+	memcpy(&hi64, src + sizeof(lo64), sizeof(hi64));
+
+	v = rb_funcall(ULL2NUM(hi64), rb_intern("<<"), 1, INT2FIX(64));
+	v = rb_funcall(v, rb_intern("+"), 1, ULL2NUM(lo64));
+	if (hi64 & 0x8000000000000000ULL)	/* bit de signo: negativo */
+		v = rb_funcall(v, rb_intern("-"), 1, fb_int128_modulus);
+	return v;
+}
+
 static VALUE fb_sql_type_from_code(int code, int subtype)
 {
 	const char *sql_type = NULL;
@@ -437,12 +495,6 @@ static VALUE fb_sql_type_from_code(int code, int subtype)
 		case blr_timestamp:
 			sql_type = "TIMESTAMP";
 			break;
-#if (FB_API_VER >= 40)
-		case SQL_TIMESTAMP_WITH_TZ:
-		case blr_ex_timestamp_tz:
-			sql_type = "TIMESTAMP WITH TIME ZONE";
-			break;
-#endif
 		case SQL_BLOB:
 		case blr_blob:
 			sql_type = "BLOB";
@@ -460,6 +512,20 @@ static VALUE fb_sql_type_from_code(int code, int subtype)
 		case blr_quad:
 			sql_type = "DECIMAL";
 			break;
+		case SQL_TIMESTAMP_TZ:
+		case SQL_TIMESTAMP_TZ_EX:
+			sql_type = "TIMESTAMP WITH TIME ZONE";
+			break;
+		case SQL_TIME_TZ:
+		case SQL_TIME_TZ_EX:
+			sql_type = "TIME WITH TIME ZONE";
+			break;
+		case SQL_DEC16:
+			sql_type = "DECFLOAT(16)";
+			break;
+		case SQL_DEC34:
+			sql_type = "DECFLOAT(34)";
+			break;
 		case SQL_TYPE_TIME:
 		case blr_sql_time:
 			sql_type = "TIME";
@@ -468,12 +534,6 @@ static VALUE fb_sql_type_from_code(int code, int subtype)
 		case blr_sql_date:
 			sql_type = "DATE";
 			break;
-#if (FB_API_VER >= 40)
-		case SQL_TIME_WITH_TZ:
-		case blr_ex_time_tz:
-			sql_type = "TIME WITH TIME ZONE";
-			break;
-#endif
 		case SQL_INT64:
 		case blr_int64:
 			switch (subtype) {
@@ -534,6 +594,289 @@ static void fb_error_check_warn(ISC_STATUS *isc_status)
 	}
 }
 
+static void fb_stmt_cache_invalidate(struct FbConnection *fb_connection);
+
+/* Operaciones que pueden bloquear (execute/fetch) se ejecutan sin el GVL para
+   que otro hilo de Ruby pueda llamar a Connection#cancel (o Ctrl-C interrumpa):
+   en ese caso la "unblock function" pide la cancelacion a Firebird para que la
+   llamada retorne. */
+#ifdef HAVE_FB_CANCEL_OPERATION
+struct fb_blocking_op {
+	ISC_STATUS *status;
+	isc_db_handle *db;
+	isc_tr_handle *tr;
+	isc_stmt_handle *stmt;
+	XSQLDA *in;
+	XSQLDA *out;
+	int fetch;
+	int rc;
+};
+
+static void *fb_blocking_run(void *arg)
+{
+	struct fb_blocking_op *op = (struct fb_blocking_op *) arg;
+	if (op->fetch)
+		op->rc = (int) isc_dsql_fetch(op->status, op->stmt, 1, op->out);
+	else
+		op->rc = (int) isc_dsql_execute2(op->status, op->tr, op->stmt, SQLDA_VERSION1, op->in, op->out);
+	return NULL;
+}
+
+static void fb_blocking_cancel(void *arg)
+{
+	struct fb_blocking_op *op = (struct fb_blocking_op *) arg;
+	ISC_STATUS status[20];
+	memset(status, 0, sizeof(status));
+	fb_cancel_operation(status, op->db, fb_cancel_raise);
+}
+
+static int fb_blocking_call(struct FbConnection *fb_connection, isc_stmt_handle *stmt,
+							XSQLDA *in, XSQLDA *out, int fetch)
+{
+	struct fb_blocking_op op;
+
+	op.status = fb_connection->isc_status;
+	op.db = &fb_connection->db;
+	op.tr = &fb_connection->transact;
+	op.stmt = stmt;
+	op.in = in;
+	op.out = out;
+	op.fetch = fetch;
+	op.rc = 0;
+#ifdef HAVE_RB_THREAD_CALL_WITHOUT_GVL
+	rb_thread_call_without_gvl(fb_blocking_run, &op, fb_blocking_cancel, &op);
+#else
+	fb_blocking_run(&op);
+#endif
+	return op.rc;
+}
+#endif /* HAVE_FB_CANCEL_OPERATION */
+
+static int fb_stmt_execute2(struct FbConnection *fb_connection, isc_stmt_handle *stmt,
+							XSQLDA *in, XSQLDA *out)
+{
+	int rc;
+#ifdef HAVE_FB_CANCEL_OPERATION
+	rc = fb_blocking_call(fb_connection, stmt, in, out, 0);
+#else
+	rc = (int) isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, stmt,
+								 SQLDA_VERSION1, in, out);
+#endif
+	/* un error puede ser "sentencia invalidada": mejor tirar la cache */
+	if (fb_connection->isc_status[0] == 1 && fb_connection->isc_status[1])
+		fb_stmt_cache_invalidate(fb_connection);
+	return rc;
+}
+
+static int fb_stmt_fetch(struct FbConnection *fb_connection, isc_stmt_handle *stmt, XSQLDA *out)
+{
+#ifdef HAVE_FB_CANCEL_OPERATION
+	return fb_blocking_call(fb_connection, stmt, NULL, out, 1);
+#else
+	return (int) isc_dsql_fetch(fb_connection->isc_status, stmt, 1, out);
+#endif
+}
+
+/* ==========================================================================
+ * Cache de sentencias preparadas por conexion
+ *
+ * Cada execute hace alloc_statement + prepare + describe_bind + describe, tres
+ * idas y vueltas al servidor que se pueden ahorrar cuando el mismo SQL se
+ * repite. La entrada guarda la sentencia ya preparada y sus descripciones
+ * (SQLDA); el cursor la toma prestada y la devuelve al cerrarse.
+ *
+ * Propiedad: un cursor con cache == NULL es dueno de su sentencia y la destruye
+ * como siempre; uno con entrada solo cierra el cursor y marca la entrada libre.
+ * ========================================================================== */
+
+/* Cache de sentencias ACTIVA (0.10.7).
+ *
+ * 0.10.6 la desactivo (segfault: la cache compartia sentencia y SQLDA entre el
+ * cursor y la entrada, y el GC podia finalizar un cursor mientras la sentencia
+ * seguia cacheada). 0.10.7 la reactiva con el anclaje de cursores: todo cursor
+ * cuya sentencia esta en la cache se mantiene vivo (rb_gc_mark de
+ * cached_cursors) hasta que la devuelve, asi la cache puede dropear sus
+ * handles con seguridad. Ver PENDIENTES-gema-fb.md.
+ *
+ * 0.10.8 corrige el SQLDA de salida con mas de SQLDA_COLSINIT (50) columnas: se
+ * reasignaba DESPUES de registrar la entrada en la cache, asi que la entrada
+ * quedaba apuntando al SQLDA de 50 liberado. La segunda ejecucion del mismo SQL
+ * leia memoria liberada (query devolvia 0 en lugar de las filas) y acababa en
+ * doble free / SIGSEGV. Ahora la reasignacion se hace antes de registrar.
+ *
+ * 0.10.9 ancla al cursor DUENO de la entrada mientras su sentencia este en la
+ * cache (FbStmtCache.owner). Firebird se guarda la direccion del campo stmt que
+ * se le da al preparar y escribe NULL ahi al hacer DSQL_drop; si el GC ya habia
+ * liberado ese cursor (y Ruby reutilizaba la misma direccion para otro), el
+ * handle del cursor nuevo quedaba a cero y el siguiente DDL fallaba con
+ * "invalid statement handle". Ver PENDIENTES-gema-fb.md, punto 3.
+ */
+#define FB_STMT_CACHE_MAX	64
+
+/* Mantiene vivo (marcado desde fb_connection_mark) el cursor cuya sentencia esta
+   en la cache: la entrada guarda el handle y los SQLDA que salieron del cursor,
+   y si el GC lo finalizaba mientras la sentencia seguia cacheada, Firebird
+   acababa escribiendo sobre esa memoria ya liberada (valgrind: invalid write de
+   isc_dsql_free_statement sobre un FbCursor liberado). */
+static void fb_cursor_pin(struct FbConnection *fb_connection, VALUE cursor)
+{
+	int i;
+	if (NIL_P(fb_connection->cached_cursors)) {
+		fb_connection->cached_cursors = rb_ary_new();
+	} else {
+		long i;
+		for (i = 0; i < RARRAY_LEN(fb_connection->cached_cursors); i++) {
+			if (RARRAY_PTR(fb_connection->cached_cursors)[i] == cursor)
+				return;
+		}
+	}
+	rb_ary_push(fb_connection->cached_cursors, cursor);
+}
+
+static void fb_cursor_unpin(struct FbConnection *fb_connection, VALUE cursor)
+{
+	/* Borrar de verdad (no dejar Qnil): connection_close/drop iteran este array
+	   y un hueco nil les hacia llamar cursor_close(nil). */
+	if (!NIL_P(fb_connection->cached_cursors))
+		rb_ary_delete(fb_connection->cached_cursors, cursor);
+}
+
+static struct FbStmtCache *fb_stmt_cache_find(struct FbConnection *fb_connection, const char *sql)
+{
+	struct FbStmtCache *e;
+
+	for (e = fb_connection->stmt_cache; e; e = e->next) {
+		if (!e->in_use && !e->invalid && strcmp(e->sql, sql) == 0)
+			return e;
+	}
+	return NULL;
+}
+
+static void fb_stmt_cache_destroy(struct FbConnection *fb_connection, struct FbStmtCache **link)
+{
+	struct FbStmtCache *e = *link;
+
+	*link = e->next;
+	if (fb_connection->db) {	/* tras desconectar, la sentencia ya no existe */
+		/* OJO: status LOCAL. Usar el de la conexion pisaba el error que se esta
+		   procesando (p.ej. el del timeout) y la excepcion se perdia. */
+		ISC_STATUS status[20];
+		memset(status, 0, sizeof(status));
+		isc_dsql_free_statement(status, &e->stmt, DSQL_drop);
+		fb_error_check_warn(status);
+	}
+	/* El cursor dueno esta anclado (fb_cursor_pin) mientras su sentencia viva en
+	   la cache: Firebird se queda con la DIRECCION del campo stmt que le dimos en
+	   isc_dsql_alloc_statement2/prepare, y al hacer DSQL_drop escribe NULL ahi
+	   ademas de en la variable que le pasamos. Si el GC ya hubiera liberado ese
+	   cursor y la memoria se hubiera reciclado para otro (es lo que hace Ruby: la
+	   misma direccion se reusa), ese NULL caia en el handle del cursor nuevo ->
+	   "invalid statement handle" al ejecutarlo (se ve con un DDL despues de
+	   consultas cacheadas). Por eso el dueno no se despina hasta este punto. */
+	if (!NIL_P(e->owner)) {
+		fb_cursor_unpin(fb_connection, e->owner);
+		e->owner = Qnil;
+	}
+	xfree(e->i_sqlda);
+	xfree(e->o_sqlda);
+	xfree(e->sql);
+	xfree(e);
+}
+
+static struct FbStmtCache *fb_stmt_cache_add(struct FbConnection *fb_connection, struct FbCursor *fb_cursor,
+											 const char *sql, long statement_type, VALUE cursor)
+{
+	struct FbStmtCache *e;
+	struct FbStmtCache **p;
+	int count = 0;
+
+	for (e = fb_connection->stmt_cache; e; e = e->next)
+		count++;
+
+	if (count >= FB_STMT_CACHE_MAX) {
+		struct FbStmtCache **free_link = NULL;
+		for (p = &fb_connection->stmt_cache; *p; p = &(*p)->next)
+			if (!(*p)->in_use) { free_link = p; break; }
+		if (!free_link)
+			return NULL;	/* todas en uso: este cursor sera dueno de su sentencia */
+		fb_stmt_cache_destroy(fb_connection, free_link);
+	}
+
+	e = (struct FbStmtCache *) xmalloc(sizeof(struct FbStmtCache));
+	e->sql = (char *) xmalloc(strlen(sql) + 1);
+	strcpy(e->sql, sql);
+	e->stmt = fb_cursor->stmt;
+	e->i_sqlda = fb_cursor->i_sqlda;
+	e->o_sqlda = fb_cursor->o_sqlda;
+	e->statement_type = statement_type;
+	e->in_use = 1;
+	e->invalid = 0;
+	e->owner = cursor;
+	e->next = fb_connection->stmt_cache;
+	fb_connection->stmt_cache = e;
+	return e;
+}
+
+/* Invalida la cache (cambio de esquema o error de ejecucion): las entradas
+   libres se destruyen ya, las que estan en uso se marcan para destruirse
+   cuando el cursor las libere (no se pueden tocar ahora). */
+static void fb_stmt_cache_invalidate(struct FbConnection *fb_connection)
+{
+	struct FbStmtCache **p = &fb_connection->stmt_cache;
+
+	while (*p) {
+		if ((*p)->in_use) {
+			(*p)->invalid = 1;
+			p = &(*p)->next;
+		} else {
+			fb_stmt_cache_destroy(fb_connection, p);	/* avanza *p */
+		}
+	}
+}
+
+/* El cursor devuelve la entrada prestada. */
+static void fb_stmt_cache_release(struct FbConnection *fb_connection, struct FbCursor *fb_cursor)
+{
+	struct FbStmtCache *e = fb_cursor->cache;
+	struct FbStmtCache **p;
+
+	fb_cursor->cache = NULL;
+	fb_cursor->stmt = 0;
+	fb_cursor->i_sqlda = NULL;
+	fb_cursor->o_sqlda = NULL;
+	if (!e)
+		return;
+
+	if (!e->invalid) {
+		e->in_use = 0;
+		return;
+	}
+
+	for (p = &fb_connection->stmt_cache; *p; p = &(*p)->next) {
+		if (*p == e) {
+			fb_stmt_cache_destroy(fb_connection, p);
+			return;
+		}
+	}
+}
+
+/* Solo libera memoria: se llama cuando la conexion ya se desconecto (las
+   sentencias se van con el detach). */
+static void fb_stmt_cache_free(struct FbConnection *fb_connection)
+{
+	struct FbStmtCache *e = fb_connection->stmt_cache, *next;
+
+	while (e) {
+		next = e->next;
+		xfree(e->i_sqlda);
+		xfree(e->o_sqlda);
+		xfree(e->sql);
+		xfree(e);
+		e = next;
+	}
+	fb_connection->stmt_cache = NULL;
+}
+
 static XSQLDA* sqlda_alloc(long cols)
 {
 	XSQLDA *sqlda;
@@ -553,9 +896,6 @@ static VALUE cursor_close _((VALUE));
 static VALUE cursor_drop _((VALUE));
 static VALUE cursor_execute _((int, VALUE*, VALUE));
 static VALUE cursor_fetchall _((int, VALUE*, VALUE));
-static VALUE sql_decimal_to_bigdecimal(long long sql_data, int scale);
-static VALUE cursor_execute2_returning(VALUE);
-static VALUE fb_hash_from_ary(VALUE, VALUE);
 
 static void fb_cursor_mark(struct FbCursor *fb_cursor);
 static void fb_cursor_free(struct FbCursor *fb_cursor);
@@ -649,6 +989,11 @@ static void fb_connection_disconnect_warn(struct FbConnection *fb_connection)
 static void fb_connection_mark(struct FbConnection *fb_connection)
 {
 	rb_gc_mark(fb_connection->cursor);
+	rb_gc_mark(fb_connection->cached_cursors);
+	/* encoding es un VALUE guardado en la struct: si no se marca, el GC puede
+	   liberarlo y force_encoding() acabaria usandolo (crash o "unknown
+	   encoding name - ..."). */
+	rb_gc_mark(fb_connection->encoding);
 }
 
 static void fb_connection_free(struct FbConnection *fb_connection)
@@ -656,6 +1001,7 @@ static void fb_connection_free(struct FbConnection *fb_connection)
 	if (fb_connection->db) {
 		fb_connection_disconnect_warn(fb_connection);
 	}
+	fb_stmt_cache_free(fb_connection);
 	xfree(fb_connection);
 }
 
@@ -1182,6 +1528,9 @@ static VALUE connection_cursor(VALUE self)
 	fb_cursor->i_buffer_size = 0;
 	fb_cursor->o_buffer = NULL;
 	fb_cursor->o_buffer_size = 0;
+	fb_cursor->exec_procedure = 0;
+	fb_cursor->fetched = 0;
+	fb_cursor->cache = NULL;
 	isc_dsql_alloc_statement2(fb_connection->isc_status, &fb_connection->db, &fb_cursor->stmt);
 	fb_error_check(fb_connection->isc_status);
 
@@ -1230,161 +1579,6 @@ static VALUE connection_execute(int argc, VALUE *argv, VALUE self)
 	return val;
 }
 
-static VALUE fb_convert_row_to_ruby(struct FbCursor *fb_cursor)
-{
-	struct FbConnection *fb_connection;
-	long cols;
-	VALUE ary;
-	long count;
-	XSQLVAR *var;
-	long dtp;
-	VALUE val;
-	VARY *vary;
-	struct tm tms;
-
-	TypedData_Get_Struct(fb_cursor->connection, struct FbConnection, &fbconnection_data_type, fb_connection);
-
-	/* Create the result tuple object */
-	cols = fb_cursor->o_sqlda->sqld;
-	ary = rb_ary_new2(cols);
-
-	/* Create the result objects for each columns */
-	for (count = 0; count < cols; count++) {
-		var = &fb_cursor->o_sqlda->sqlvar[count];
-		dtp = var->sqltype & ~1;
-
-		/* Check if column is null */
-		if ((var->sqltype & 1) && (*var->sqlind < 0)) {
-			val = Qnil;
-		} else {
-			/* Set the column value to the result tuple */
-
-			switch (dtp) {
-				case SQL_TEXT:
-					val = rb_str_new(var->sqldata, var->sqllen);
-					#if HAVE_RUBY_ENCODING_H
-					rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
-					#endif
-					break;
-
-				case SQL_VARYING:
-					vary = (VARY*)var->sqldata;
-					val = rb_str_new(vary->vary_string, vary->vary_length);
-					#if HAVE_RUBY_ENCODING_H
-					rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
-					#endif
-					break;
-
-				case SQL_SHORT:
-					if (var->sqlscale < 0) {
-						val = sql_decimal_to_bigdecimal((long long)*(ISC_SHORT*)var->sqldata, var->sqlscale);
-					} else {
-						val = INT2NUM((int)*(short*)var->sqldata);
-					}
-					break;
-
-				case SQL_LONG:
-					if (var->sqlscale < 0) {
-						val = sql_decimal_to_bigdecimal((long long)*(ISC_LONG*)var->sqldata, var->sqlscale);
-					} else {
-						val = INT2NUM(*(ISC_LONG*)var->sqldata);
-					}
-					break;
-
-				case SQL_INT64:
-					if (var->sqlscale < 0) {
-						val = sql_decimal_to_bigdecimal(*(ISC_INT64*)var->sqldata, var->sqlscale);
-					} else {
-						val = LL2NUM(*(ISC_INT64*)var->sqldata);
-					}
-					break;
-
-				case SQL_TYPE_DATE:
-					isc_decode_sql_date((ISC_DATE *)var->sqldata, &tms);
-					val = fb_mkdate(&tms);
-					break;
-
-				case SQL_TIMESTAMP:
-					isc_decode_timestamp((ISC_TIMESTAMP *)var->sqldata, &tms);
-					val = fb_mktime(&tms, "local");
-					break;
-#if (FB_API_VER >= 40)
-				case SQL_TIMESTAMP_WITH_TZ:
-					{
-						ISC_TIMESTAMP_WITH_TZ *ts_tz = (ISC_TIMESTAMP_WITH_TZ *)var->sqldata;
-						isc_decode_timestamp(&(ts_tz->timestamp), &tms);
-						/* The time_zone field is a key to the RDB$TIME_ZONES table.
-						   For now, we can't easily look it up.
-						   Firebird 4.0 API has isc_decode_timestamp_with_tz which gives offset.
-						   Without it, we assume UTC as a fallback.
-						   A proper implementation would query RDB$TIME_ZONES. */
-						val = fb_mktime(&tms, "utc");
-					}
-					break;
-#endif					
-
-				default:
-					rb_warn("Unhandled data type %ld in fb_convert_row_to_ruby, treating as Nil.", dtp);
-					val = Qnil;
-					break;
-			}
-		}
-		rb_ary_push(ary, val);
-	}
-
-	return ary;
-}
-
-
-/* call-seq:
- *   execute_with_returning(sql, *args) -> Array of Hashes
- *
- * Executes a DML statement (INSERT, UPDATE, DELETE) with a RETURNING clause
- * and returns an array containing the returned values.
- *
- * If no transaction is currently active, a transaction is automatically started
- * and committed.
- */
-static VALUE connection_execute_with_returning(int argc, VALUE *argv, VALUE self)
-{
-	VALUE cursor, val, args;
-	struct FbCursor *fb_cursor;
-	struct FbConnection *fb_connection;
-	int state;
-
-	TypedData_Get_Struct(self, struct FbConnection, &fbconnection_data_type, fb_connection);
-	fb_connection_check(fb_connection);
-
-	cursor = connection_cursor(self);
-	TypedData_Get_Struct(cursor, struct FbCursor, &fbcursor_data_type, fb_cursor);
-
-	args = rb_ary_new4(argc, argv);
-	rb_ary_push(args, cursor);
-
-	if (!fb_connection->transact) {
-		fb_connection_transaction_start(fb_connection, Qnil);
-		fb_cursor->auto_transact = fb_connection->transact;
-
-		val = rb_protect((VALUE(*)(VALUE))cursor_execute2_returning, args, &state);
-		if (state) {
-			fb_connection_rollback(fb_connection);
-			rb_jump_tag(state);
-		}
-		fb_connection_commit(fb_connection);
-	} else {
-		val = cursor_execute2_returning(args);
-	}
-
-	cursor_drop(cursor);
-
-	if (rb_block_given_p()) {
-		return rb_ary_each(val);
-	} else {
-		return val;
-	}
-	return val; // Rows affected
-}
-
 /* call-seq:
  *   query(:array, sql, *arg) -> Array of Arrays or nil
  *   query(:hash, sql, *arg) -> Array of Hashes or nil
@@ -1412,37 +1606,86 @@ static VALUE connection_query(int argc, VALUE *argv, VALUE self)
 	} else {
 		format = ID2SYM(rb_intern("array"));
 	}
-	
 	cursor = connection_cursor(self);
 	result = cursor_execute(argc, argv, cursor);
-	
-	// Verificar el tipo de resultado
-	if (TYPE(result) == T_ARRAY) {
-		// Es una consulta con RETURNING - ya tenemos los resultados
-		cursor_drop(cursor);
-		if (rb_block_given_p()) {
-			return rb_ary_each(result);
-		} else {
-			return result;
-		}
-	} else if (result == cursor) {
-		// Es un SELECT sin RETURNING - necesitamos hacer fetchall
-		if (rb_block_given_p()) {
-			// Si hay bloque, usar cursor_each que ya está implementado
-			cursor_each(1, &format, cursor);
-			cursor_close(cursor);
-			return Qnil;
-		} else {
-			// Sin bloque, hacer fetchall normal
-			VALUE fetch_result = cursor_fetchall(1, &format, cursor);
-			cursor_close(cursor);
-			return fetch_result;
-		}
-	} else {
-		// Es un DML sin RETURNING (número de filas afectadas)
-		cursor_drop(cursor);
-		return result;
+	if (NIL_P(result)) {
+		result = cursor_fetchall(1, &format, cursor);
+		cursor_close(cursor);
 	}
+
+	return result;
+}
+
+/* call-seq:
+ *   encoding = name -> name
+ *
+ * Cambia el encoding con el que el driver etiqueta los strings que devuelve.
+ * Actualiza el ivar y el campo C (el ivar solo no basta: el driver usa el C).
+ */
+static VALUE connection_set_encoding(VALUE self, VALUE encoding)
+{
+	struct FbConnection *fb_connection;
+
+	TypedData_Get_Struct(self, struct FbConnection, &fbconnection_data_type, fb_connection);
+	fb_connection->encoding = encoding;
+	rb_iv_set(self, "@encoding", encoding);
+	return encoding;
+}
+
+/* call-seq:
+ *   command_timeout() -> Float
+ *
+ * Segundos maximos que puede tardar una sentencia en esta conexion (0 = sin
+ * limite). Se aplica a cada sentencia en el momento de prepararla.
+ */
+static VALUE connection_command_timeout(VALUE self)
+{
+	struct FbConnection *fb_connection;
+
+	TypedData_Get_Struct(self, struct FbConnection, &fbconnection_data_type, fb_connection);
+	return rb_float_new(fb_connection->command_timeout_ms / 1000.0);
+}
+
+/* call-seq:
+ *   command_timeout = seconds -> seconds
+ */
+static VALUE connection_set_command_timeout(VALUE self, VALUE seconds)
+{
+	struct FbConnection *fb_connection;
+
+	TypedData_Get_Struct(self, struct FbConnection, &fbconnection_data_type, fb_connection);
+	if (NIL_P(seconds)) {
+		fb_connection->command_timeout_ms = 0;
+	} else {
+		double secs = NUM2DBL(seconds);
+		if (secs < 0.0)
+			rb_raise(rb_eArgError, "command_timeout must be >= 0");
+		fb_connection->command_timeout_ms = (long) (secs * 1000.0);
+	}
+	return seconds;
+}
+
+/* call-seq:
+ *   cancel() -> true
+ *
+ * Pide a Firebird que cancele la operacion en curso en esta conexion. Pensado
+ * para llamarse desde otro hilo (la ejecucion cede el GVL mientras espera).
+ */
+static VALUE connection_cancel(VALUE self)
+{
+#ifdef HAVE_FB_CANCEL_OPERATION
+	struct FbConnection *fb_connection;
+	ISC_STATUS status[20];
+
+	TypedData_Get_Struct(self, struct FbConnection, &fbconnection_data_type, fb_connection);
+	fb_connection_check(fb_connection);
+	memset(status, 0, sizeof(status));
+	fb_cancel_operation(status, &fb_connection->db, fb_cancel_raise);
+	fb_error_check(status);
+	return Qtrue;
+#else
+	rb_raise(rb_eFbError, "cancel is not supported by this Firebird client");
+#endif
 }
 
 /* call-seq:
@@ -1529,8 +1772,17 @@ static void fb_cursor_drop(struct FbCursor *fb_cursor)
 		isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_close);
 		fb_error_check(isc_status);
 	}
-	isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_drop);
-	fb_error_check(isc_status);
+	if (fb_cursor->cache) {
+		struct FbConnection *fb_connection;
+		TypedData_Get_Struct(fb_cursor->connection, struct FbConnection, &fbconnection_data_type, fb_connection);
+		fb_stmt_cache_release(fb_connection, fb_cursor);	/* la sentencia vuelve a la cache */
+		return;
+	}
+	if (fb_cursor->stmt) {
+		isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_drop);
+		fb_error_check(isc_status);
+		fb_cursor->stmt = 0;
+	}
 }
 
 static void fb_cursor_drop_warn(struct FbCursor *fb_cursor)
@@ -1540,8 +1792,17 @@ static void fb_cursor_drop_warn(struct FbCursor *fb_cursor)
 		isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_close);
 		fb_error_check_warn(isc_status);
 	}
-	isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_drop);
-	fb_error_check_warn(isc_status);
+	if (fb_cursor->cache) {
+		struct FbConnection *fb_connection;
+		TypedData_Get_Struct(fb_cursor->connection, struct FbConnection, &fbconnection_data_type, fb_connection);
+		fb_stmt_cache_release(fb_connection, fb_cursor);
+		return;
+	}
+	if (fb_cursor->stmt) {
+		isc_dsql_free_statement(isc_status, &fb_cursor->stmt, DSQL_drop);
+		fb_error_check_warn(isc_status);
+		fb_cursor->stmt = 0;
+	}
 }
 
 static void fb_cursor_mark(struct FbCursor *fb_cursor)
@@ -1554,10 +1815,30 @@ static void fb_cursor_mark(struct FbCursor *fb_cursor)
 static void fb_cursor_free(struct FbCursor *fb_cursor)
 {
 	if (fb_cursor->stmt) {
-		fb_cursor_drop_warn(fb_cursor);
+		if (fb_cursor->cache) {
+			/* La sentencia y los SQLDA pertenecen a la cache de la conexion.
+			   Aqui corremos dentro del GC: la conexion puede estar ya liberada,
+			   asi que NO se puede desreferenciar fb_cursor->connection ni tocar
+			   la entrada. Se cierra/destruye la sentencia con un status local
+			   (si la conexion sigue viva es correcto; si ya no, solo avisa) y
+			   la entrada queda marcada en uso hasta que la conexion muera. */
+			/* La sentencia (y sus SQLDA) son de la entrada de la cache: este
+			   cursor NO debe tocarlas. Ni DSQL_drop ni DSQL_close: aqui corremos
+			   dentro del GC (puede que mientras otra llamada a Firebird esta en
+			   vuelo, con el GVL cedido) y tocar un handle ajeno escribia sobre
+			   memoria ya reciclada -> segfault al llegar un DDL
+			   (valgrind: invalid write de isc_dsql_free_statement dentro de
+			   fb_stmt_cache_destroy, en un bloque que era un FbCursor liberado).
+			   La entrada se libera cuando la cache haga invalidate/dispose. */
+			fb_cursor->stmt = 0; /* solo olvidarlo */
+		} else {
+			fb_cursor_drop_warn(fb_cursor);
+		}
 	}
-	xfree(fb_cursor->i_sqlda);
-	xfree(fb_cursor->o_sqlda);
+	if (!fb_cursor->cache) {	/* los SQLDA de una sentencia cacheada son de la entrada */
+		xfree(fb_cursor->i_sqlda);
+		xfree(fb_cursor->o_sqlda);
+	}
 	xfree(fb_cursor->i_buffer);
 	xfree(fb_cursor->o_buffer);
 	xfree(fb_cursor);
@@ -1565,94 +1846,106 @@ static void fb_cursor_free(struct FbCursor *fb_cursor)
 
 static VALUE sql_decimal_to_bigdecimal(long long sql_data, int scale)
 {
-    int is_negative = 0;
-    unsigned long long abs_data;
-    char digits_buf[64];
-    int wrote;
-
-    /* Handle negative numbers */
-    if (sql_data < 0) {
-        is_negative = 1;
-        /* avoid signed overflow */
-        abs_data = (unsigned long long)(- (long long)sql_data);
-    } else {
-        abs_data = (unsigned long long)sql_data;
-    }
-
-    /* convert absolute integer to decimal digit string */
-    wrote = snprintf(digits_buf, sizeof(digits_buf), "%llu", (unsigned long long)abs_data);
-    if (wrote < 0) {
-        rb_raise(rb_eRuntimeError, "Decimal conversion error");
-    }
-    if (wrote >= (int)sizeof(digits_buf)) {
-        /* Should not happen for reasonable data, but guard anyway */
-        rb_raise(rb_eRuntimeError, "Decimal conversion result too large");
-    }
-    int digits = wrote;
-
-    int decimal_places = (scale < 0) ? -scale : 0;
-    /* compute needed size: digits + decimal point (if any) + possible leading zeros + sign + NUL */
-    int needed = digits + (decimal_places ? 1 + decimal_places : 0) + (is_negative ? 1 : 0) + 1;
-    char *buf = xmalloc(needed);
-
-    char *p = buf;
-    if (decimal_places) {
-        /* need to place decimal point decimal_places from right */
-        if (decimal_places >= digits) {
-            /* result like 0.00...digits */
-            *p++ = '0';
-            *p++ = '.';
-            for (int i = 0; i < decimal_places - digits; ++i) *p++ = '0';
-            memcpy(p, digits_buf, digits); p += digits;
-        } else {
-            int dot_pos = digits - decimal_places;
-            memcpy(p, digits_buf, dot_pos); p += dot_pos;
-            *p++ = '.';
-            memcpy(p, digits_buf + dot_pos, decimal_places); p += decimal_places;
-        }
-    } else {
-        memcpy(p, digits_buf, digits); p += digits;
-    }
-    *p = '\0';
-
-    VALUE bd_str;
-    if (is_negative) {
-        /* build final string with '-' prefix */
-        int len = (int)strlen(buf);
-        char *buf2 = xmalloc(len + 2);
-        buf2[0] = '-';
-        memcpy(buf2 + 1, buf, len + 1);
-        bd_str = rb_str_new2(buf2);
-        xfree(buf2);
-    } else {
-        bd_str = rb_str_new2(buf);
-    }
-    xfree(buf);
-
-    return rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, bd_str);
+	char bigdecimal_buffer[128];  /* Increased buffer size */
+	int is_negative = 0;
+	unsigned long long abs_data;
+	int len, decimal_places, dot_pos;
+	
+	/* Handle negative numbers */
+	if (sql_data < 0) {
+		is_negative = 1;
+		/* Use unsigned arithmetic to avoid overflow with minimum integer value */
+		abs_data = (unsigned long long)(-sql_data);
+	} else {
+		abs_data = (unsigned long long)sql_data;
+	}
+	
+	/* Convert to string */
+	int wrote = snprintf(bigdecimal_buffer, sizeof(bigdecimal_buffer), "%llu", abs_data);
+	if (wrote < 0 || wrote >= (int)sizeof(bigdecimal_buffer)) {
+		rb_raise(rb_eRuntimeError, "Buffer overflow in decimal conversion");
+	}
+	len = wrote;
+	
+	/* Add decimal point if scale != 0 */
+	if (scale != 0) {
+		decimal_places = (scale < 0) ? -scale : scale;
+		dot_pos = len - decimal_places;
+		
+		/* If we need leading zeros before the decimal point */
+		if (dot_pos <= 0) {
+			/* Need to add leading zeros to ensure at least one digit before decimal point */
+			int leading_zeros = 1 - dot_pos;
+			
+			/* Check buffer bounds */
+			if (len + leading_zeros + 1 >= (int)sizeof(bigdecimal_buffer)) {
+				rb_raise(rb_eRuntimeError, "Buffer overflow in decimal conversion");
+			}
+			
+			/* Shift the string to make room for leading zeros */
+			memmove(bigdecimal_buffer + leading_zeros, bigdecimal_buffer, len + 1);
+			
+			/* Add leading zeros */
+			memset(bigdecimal_buffer, '0', leading_zeros);
+			
+			len += leading_zeros;
+			dot_pos = len - decimal_places;
+		}
+		
+		/* Check buffer bounds before inserting decimal point */
+		if (len + 1 >= (int)sizeof(bigdecimal_buffer)) {
+			rb_raise(rb_eRuntimeError, "Buffer overflow in decimal conversion");
+		}
+		
+		/* Insert decimal point */
+		memmove(bigdecimal_buffer + dot_pos + 1, bigdecimal_buffer + dot_pos, len - dot_pos);
+		bigdecimal_buffer[dot_pos] = '.';
+		bigdecimal_buffer[len + 1] = '\0';
+	}
+	
+	/* Add minus sign if needed - do this AFTER decimal point placement */
+	if (is_negative) {
+		/* Shift string to make room for minus sign */
+		len = (int)strlen(bigdecimal_buffer);
+		memmove(bigdecimal_buffer + 1, bigdecimal_buffer, len + 1);
+		bigdecimal_buffer[0] = '-';
+		bigdecimal_buffer[len + 1] = '\0';  /* Ensure proper null termination */
+	}
+	
+	return rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, rb_str_new2(bigdecimal_buffer));
 }
 
 static VALUE object_to_unscaled_bigdecimal(VALUE object, int scale)
 {
-    long long ratio = 1;
-    if (scale >= 0) {
-        /* no scaling required */
-        if (TYPE(object) == T_FLOAT)
-            object = rb_funcall(object, rb_intern("to_s"), 0);
-        object = rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, object);
-        return rb_funcall(object, rb_intern("round"), 0);
-    }
-    /* scale < 0: multiply by 10^(-scale) */
-    int times = -scale;
-    for (int i = 0; i < times; ++i) {
-        /* watch overflow for extreme scales; for typical DB scales this is fine */
-        ratio *= 10LL;
-    }
-    if (TYPE(object) == T_FLOAT)
-        object = rb_funcall(object, rb_intern("to_s"), 0);
-    object = rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, object);
-    object = rb_funcall(object, rb_intern("*"), 1, LL2NUM(ratio));
-    return rb_funcall(object, rb_intern("round"), 0);
+	int i;
+	long ratio = 1;
+	for (i = 0; i > scale; i--)
+		ratio *= 10;
+	if (TYPE(object) == T_FLOAT)
+		object = rb_funcall(object, rb_intern("to_s"), 0);
+	object = rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, object);
+	object = rb_funcall(object, rb_intern("*"), 1, LONG2NUM(ratio));
+	return rb_funcall(object, rb_intern("round"), 0);
+}
+
+/* Los tipos "con zona" (Firebird 4+) se escriben como instante en UTC con la
+   zona GMT: la zona de Firebird es un id de 16 bits de RDB$TIME_ZONES (GMT =
+   0xFFFF) y un Time de Ruby es un offset fijo, asi que se normaliza la zona
+   pero se conserva el instante exacto. */
+#define FB_TIME_ZONE_GMT	65535
+
+static void fb_tm_from_zoned(struct tm *tm, VALUE obj)
+{
+	VALUE t = obj;
+	if (!rb_obj_is_kind_of(t, rb_cTime)) {
+		if (rb_respond_to(t, rb_intern("to_str")))
+			t = rb_funcall(rb_cTime, rb_intern("parse"), 1, rb_funcall(t, rb_intern("to_str"), 0));
+		else if (rb_respond_to(t, rb_intern("to_time")))
+			t = rb_funcall(t, rb_intern("to_time"), 0);
+		else
+			rb_raise(rb_eTypeError, "Expecting Time object or string.");
+	}
+	tm_from_timestamp(tm, rb_funcall(t, rb_intern("getutc"), 0));
 }
 
 static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VALUE *argv)
@@ -1709,9 +2002,13 @@ static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VAL
 						rb_raise(rb_eRangeError, "CHAR overflow: %ld bytes exceeds %d byte(s) allowed.",
 							RSTRING_LEN(obj), var->sqllen);
 					}
+					/* Relleno a la longitud declarada. Antes se mutaba var->sqllen
+					   para mandar solo los bytes del valor; con la cache de sentencias
+					   esa descripcion se comparte entre cursores, asi que la mutacion
+					   corromperia el resto de usos. */
+					memset(var->sqldata, ' ', var->sqllen);
 					memcpy(var->sqldata, RSTRING_PTR(obj), RSTRING_LEN(obj));
-					var->sqllen = RSTRING_LEN(obj);
-					offset += var->sqllen + 1;
+					offset += var->sqllen;
 					break;
 
 				case SQL_VARYING :
@@ -1811,11 +2108,11 @@ static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VAL
 					fb_error_check(fb_connection->isc_status);
 					length = RSTRING_LEN(obj);
 					p = RSTRING_PTR(obj);
-					while (length >= 4096) {
-						isc_put_segment(fb_connection->isc_status,&blob_handle,4096,p);
+					while (length >= FB_BLOB_SEGMENT_SIZE) {
+						isc_put_segment(fb_connection->isc_status,&blob_handle,FB_BLOB_SEGMENT_SIZE,p);
 						fb_error_check(fb_connection->isc_status);
-						p += 4096;
-						length -= 4096;
+						p += FB_BLOB_SEGMENT_SIZE;
+						length -= FB_BLOB_SEGMENT_SIZE;
 					}
 					if (length) {
 						isc_put_segment(fb_connection->isc_status,&blob_handle,length,p);
@@ -1852,22 +2149,6 @@ static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VAL
 					offset += alignment;
 					break;
 
-#if (FB_API_VER >= 40)
-				case SQL_TIMESTAMP_WITH_TZ:
-					{
-						offset = FB_ALIGN(offset, alignment);
-						var->sqldata = (char *)(fb_cursor->i_buffer + offset);
-						tm_from_timestamp(&tms, obj);
-						ISC_TIMESTAMP_WITH_TZ *ts_tz = (ISC_TIMESTAMP_WITH_TZ *)var->sqldata;
-						isc_encode_timestamp(&tms, &(ts_tz->timestamp));
-						/* This is a simplification. A full implementation would need to look up
-						   the time zone name in RDB$TIME_ZONES and set ts_tz->time_zone. */
-						ts_tz->time_zone = 0; // Fallback to unknown/unspecified
-						offset += alignment;
-					}
-					break;
-#endif
-
 #if 0
 				case SQL_ARRAY :
 					/* Not supported now
@@ -1882,28 +2163,48 @@ static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VAL
 					break;
 #endif
 
-#if (FB_API_VER >= 30)
 				case SQL_BOOLEAN:
 					offset = FB_ALIGN(offset, alignment);
 					var->sqldata = (char *)(fb_cursor->i_buffer + offset);
 					*(bool *)var->sqldata = obj;
 					offset += alignment;
 					break;
-#endif
 
-#if (FB_API_VER >= 40)
 				case SQL_INT128:
 					offset = FB_ALIGN(offset, alignment);
 					var->sqldata = (char *)(fb_cursor->i_buffer + offset);
-					if (var->sqlscale < 0) {
-						llvalue = NUM2LL(object_to_unscaled_bigdecimal(obj, var->sqlscale));
-					} else {
-						llvalue = NUM2LL(object_to_fixnum(obj));
-					}
-					*(ISC_INT64 *)var->sqldata = llvalue;
+					/* 128 bits completos: un bignum no pasa por NUM2LL */
+					fb_int128_write(var->sqldata, (var->sqlscale < 0)
+						? object_to_unscaled_bigdecimal(obj, var->sqlscale)
+						: object_to_fixnum(obj));
 					offset += alignment;
 					break;
-#endif
+
+				case SQL_TIMESTAMP_TZ:
+				case SQL_TIMESTAMP_TZ_EX:
+					offset = FB_ALIGN(offset, alignment);
+					var->sqldata = (char *)(fb_cursor->i_buffer + offset);
+					fb_tm_from_zoned(&tms, obj);
+					isc_encode_timestamp(&tms, (ISC_TIMESTAMP *)var->sqldata);
+					/* el campo son 12 bytes: instante (8) + id de zona (2) */
+					*(unsigned short *)(var->sqldata + sizeof(ISC_TIMESTAMP)) = FB_TIME_ZONE_GMT;
+					offset += alignment;
+					break;
+
+				case SQL_TIME_TZ:
+				case SQL_TIME_TZ_EX:
+					offset = FB_ALIGN(offset, alignment);
+					var->sqldata = (char *)(fb_cursor->i_buffer + offset);
+					fb_tm_from_zoned(&tms, obj);
+					isc_encode_sql_time(&tms, (ISC_TIME *)var->sqldata);
+					/* 8 bytes: hora (4) + id de zona (2) */
+					*(unsigned short *)(var->sqldata + sizeof(ISC_TIME)) = FB_TIME_ZONE_GMT;
+					offset += alignment;
+					break;
+
+				case SQL_DEC16:
+				case SQL_DEC34:
+					rb_raise(rb_eFbError, "DECFLOAT datatype is not supported in this driver version");
 
 				default:
 					rb_raise(rb_eFbError, "Specified table includes unsupported datatype (%d)", dtp);
@@ -1927,7 +2228,534 @@ static void fb_cursor_set_inputparams(struct FbCursor *fb_cursor, long argc, VAL
 	}
 }
 
-static void fb_cursor_execute_withparams(struct FbCursor *fb_cursor, long argc, VALUE *argv)
+#ifdef FB_HAVE_BATCH_API
+
+/* ==========================================================================
+ * Batch de protocolo (Firebird 4+)
+ *
+ * El camino legacy ejecuta isc_dsql_execute2 una vez por registro, o sea un
+ * round trip por fila. Con IBatch los mensajes se agrupan y se mandan en una
+ * sola operacion (op_batch_create/msg/exec, que implementa libfbclient; desde
+ * C no se emiten a mano). Los puentes fb_get_statement_interface /
+ * fb_get_transaction_interface (Firebird 4.0+) convierten los handles legacy
+ * de fb.c en los objetos que necesita la API OO.
+ * ========================================================================== */
+
+#define FB_BATCH_ROWS_PER_ADD	500
+/* Tamano del buffer de batch que se declara en el BPB. */
+#define FB_BATCH_BUFFER_BYTES	(32 * 1024 * 1024)
+/* Umbral de troceo del cliente: la MITAD del declarado, porque el servidor
+ * cuenta tambien las cabeceras BLR ademas de los mensajes y su comprobacion
+ * salta antes de llegar al limite declarado (si se usa el mismo valor, el
+ * IBatch_add que cruza el limite falla antes de la primera ejecucion). */
+#define FB_BATCH_FLUSH_BYTES	(FB_BATCH_BUFFER_BYTES / 2)
+/* Minimo de filas para que el batch compense: con una sola fila paga los
+ * puentes y un createBatch extra (~4 us) sin ganar nada. */
+#define FB_BATCH_MIN_ROWS	2
+/* Fila mas grande que se acepta empaquetar en el lote (mensaje + blobs). Los
+ * blobs ocupan lugar en el buffer del lote del servidor, asi que una fila
+ * enorme (un blob de decenas de MB) no entra: esa va por el camino legacy,
+ * que no tiene ese limite. */
+#define FB_BATCH_MAX_ROW_BYTES	(FB_BATCH_FLUSH_BYTES / 2)
+
+typedef struct {
+	unsigned offset;
+	unsigned null_offset;		/* (unsigned)-1 si el parametro no admite NULL */
+	unsigned type;				/* SQL_* */
+	unsigned length;
+	int		 scale;
+	int		 has_null;
+} FbBatchField;
+
+static IMaster *fb_oo_master;
+static IUtil   *fb_oo_util;
+static IStatus *fb_oo_status;
+
+/* El master interface se pide una sola vez por proceso. */
+static IStatus *fb_batch_status(void)
+{
+	if (!fb_oo_master) {
+		fb_oo_master = fb_get_master_interface();
+		if (!fb_oo_master)
+			return NULL;
+		fb_oo_util = IMaster_getUtilInterface(fb_oo_master);
+		fb_oo_status = IMaster_getStatus(fb_oo_master);
+	}
+	return fb_oo_status;
+}
+
+/* IStatus::getErrors() devuelve el mismo vector ISC_STATUS que usa la API
+   legacy, asi que el reporte de errores se reutiliza tal cual. */
+static void fb_batch_error_check(IStatus *status)
+{
+	if (IStatus_getState(status) & IStatus_STATE_ERRORS) {
+		ISC_STATUS *vector = (ISC_STATUS *) IStatus_getErrors(status);
+		fb_error_check(vector);
+		rb_raise(rb_eFbError, "Firebird batch error");
+	}
+}
+
+/* Suelta las interfaces obtenidas y devuelve -1 (= usar el loop legacy). */
+static long fb_batch_give_up(IStatement *istmt, ITransaction *itra,
+							 IMessageMetadata *meta, IXpbBuilder *pb, IBatch *batch)
+{
+	if (batch) IBatch_release(batch);
+	if (pb) IXpbBuilder_dispose(pb);
+	if (meta) IMessageMetadata_release(meta);
+	if (istmt) IStatement_release(istmt);
+	if (itra) ITransaction_release(itra);
+	return -1;
+}
+
+/* Bytes que ocupan los blobs de una fila (0 si no hay blobs). Sirve para
+   decidir cuantas filas entran en un lote: el servidor cuenta los blobs dentro
+   de su buffer de batch, asi que hay que contarlos junto con los mensajes. */
+static size_t fb_batch_row_blob_bytes(VALUE row, unsigned nparams, FbBatchField *f)
+{
+	size_t total = 0;
+	unsigned i;
+
+	if (TYPE(row) != T_ARRAY || RARRAY_LEN(row) != (long) nparams)
+		return 0;
+
+	for (i = 0; i < nparams; i++) {
+		VALUE obj;
+		if (f[i].type != SQL_BLOB)
+			continue;
+		obj = RARRAY_PTR(row)[i];
+		if (NIL_P(obj))
+			continue;
+		total += (size_t) RSTRING_LEN(rb_obj_as_string(obj));
+	}
+	return total;
+}
+
+/* Empaqueta una fila en el buffer de mensajes segun la metadata.
+   Devuelve NULL si todo bien, o el mensaje de error (sin lanzar excepcion,
+   para poder liberar memoria antes de hacerlo). */
+static const char *fb_batch_pack_row(IBatch *batch, IStatus *status, char *msg, VALUE *vals,
+									 unsigned nparams, FbBatchField *f, struct tm *tms)
+{
+	unsigned i;
+
+	for (i = 0; i < nparams; i++) {
+		VALUE obj = vals[i];
+		char *dest = msg + f[i].offset;
+
+		if (f[i].has_null)
+			*(short *)(msg + f[i].null_offset) = NIL_P(obj) ? -1 : 0;
+
+		if (NIL_P(obj)) {
+			if (!f[i].has_null)
+				return "specified column is not permitted to be null";
+			continue;
+		}
+
+		switch (f[i].type) {
+		case SQL_VARYING: {
+			VARY *vary = (VARY *) dest;
+			obj = rb_obj_as_string(obj);
+			if ((unsigned) RSTRING_LEN(obj) > f[i].length)
+				return "VARCHAR overflow: value exceeds the column length";
+			vary->vary_length = (short) RSTRING_LEN(obj);
+			memcpy(vary->vary_string, RSTRING_PTR(obj), RSTRING_LEN(obj));
+			break;
+		}
+		case SQL_TEXT:
+			obj = rb_obj_as_string(obj);
+			if ((unsigned) RSTRING_LEN(obj) > f[i].length)
+				return "CHAR overflow: value exceeds the column length";
+			memset(dest, ' ', f[i].length);
+			memcpy(dest, RSTRING_PTR(obj), RSTRING_LEN(obj));
+			break;
+		case SQL_SHORT: {
+			long lvalue = (f[i].scale < 0)
+				? NUM2LONG(object_to_unscaled_bigdecimal(obj, f[i].scale))
+				: NUM2LONG(object_to_fixnum(obj));
+			if (lvalue < -32768 || lvalue > 32767)
+				return "short integer overflow";
+			*(short *) dest = (short) lvalue;
+			break;
+		}
+		case SQL_LONG: {
+			long lvalue = (f[i].scale < 0)
+				? NUM2LONG(object_to_unscaled_bigdecimal(obj, f[i].scale))
+				: NUM2LONG(object_to_fixnum(obj));
+			if (lvalue < -2147483648LL || lvalue > 2147483647LL)
+				return "integer overflow";
+			*(ISC_LONG *) dest = (ISC_LONG) lvalue;
+			break;
+		}
+		case SQL_INT64:
+			*(ISC_INT64 *) dest = (f[i].scale < 0)
+				? NUM2LL(object_to_unscaled_bigdecimal(obj, f[i].scale))
+				: NUM2LL(object_to_fixnum(obj));
+			break;
+		case SQL_FLOAT: {
+			double dvalue = NUM2DBL(double_from_obj(obj));
+			double dcheck = (dvalue < 0.0) ? -dvalue : dvalue;
+			if (dcheck != 0.0 && (dcheck < FLT_MIN || dcheck > FLT_MAX))
+				return "float overflow";
+			*(float *) dest = (float) dvalue;
+			break;
+		}
+		case SQL_DOUBLE:
+			*(double *) dest = NUM2DBL(double_from_obj(obj));
+			break;
+		case SQL_TIMESTAMP:
+			tm_from_timestamp(tms, obj);
+			isc_encode_timestamp(tms, (ISC_TIMESTAMP *) dest);
+			break;
+		case SQL_TYPE_TIME:
+			tm_from_timestamp(tms, obj);
+			isc_encode_sql_time(tms, (ISC_TIME *) dest);
+			break;
+		case SQL_TYPE_DATE:
+			tm_from_date(tms, obj);
+			isc_encode_sql_date(tms, (ISC_DATE *) dest);
+			break;
+		case SQL_BOOLEAN:
+			*(bool *) dest = RTEST(obj) ? true : false;
+			break;
+		case SQL_INT128:
+			fb_int128_write(dest, (f[i].scale < 0)
+				? object_to_unscaled_bigdecimal(obj, f[i].scale)
+				: object_to_fixnum(obj));
+			break;
+		case SQL_BLOB: {
+			/* El blob no viaja en el mensaje: el mensaje lleva solo su id, y
+			   los bytes van por el flujo de blobs del batch (IBatch_addBlob),
+			   que la libreria cliente empaqueta y manda junto con los
+			   mensajes. Antes cada blob pagaba create_blob, un put_segment por
+			   cada 64 KB (o cada 4 KB) y el close, todo con su ida y vuelta. */
+			ISC_QUAD blob_id;
+			long blob_length;
+			char *blob_ptr;
+
+			memset(&blob_id, 0, sizeof(blob_id));
+			obj = rb_obj_as_string(obj);
+			blob_length = RSTRING_LEN(obj);
+			blob_ptr = RSTRING_PTR(obj);
+
+			if (blob_length <= FB_BLOB_SEGMENT_SIZE) {
+				IBatch_addBlob(batch, status, (unsigned) blob_length, blob_ptr,
+							   &blob_id, 0, NULL);
+			} else {
+				unsigned chunk;
+				IBatch_addBlob(batch, status, (unsigned) FB_BLOB_SEGMENT_SIZE, blob_ptr,
+							   &blob_id, 0, NULL);
+				blob_ptr += FB_BLOB_SEGMENT_SIZE;
+				blob_length -= FB_BLOB_SEGMENT_SIZE;
+				/* El resto va en trozos del tamano maximo de segmento: con
+				   blobs segmentados (el modo que declara el driver, igual que
+				   isc_create_blob2) un segmento no puede pasar de 64 KB - 1. */
+				while (blob_length > 0 &&
+					   !(IStatus_getState(status) & IStatus_STATE_ERRORS)) {
+					chunk = (blob_length > FB_BLOB_SEGMENT_SIZE)
+						? (unsigned) FB_BLOB_SEGMENT_SIZE : (unsigned) blob_length;
+					IBatch_appendBlobData(batch, status, chunk, blob_ptr);
+					blob_ptr += chunk;
+					blob_length -= chunk;
+				}
+			}
+
+			if (IStatus_getState(status) & IStatus_STATE_ERRORS)
+				return "no se pudo enviar el blob al batch";
+
+			*(ISC_QUAD *) dest = blob_id;
+			break;
+		}
+		default:
+			return "datatype not supported by the batch path";
+		}
+	}
+	return NULL;
+}
+
+/* Ejecuta el lote acumulado y devuelve las filas afectadas; en error deja el
+   indice y el texto en fail_pos/fail_msg y devuelve -1. */
+static long fb_batch_execute_and_count(IBatch *batch, ITransaction *itra, IStatus *status,
+									   unsigned *fail_pos, char *fail_msg, size_t fail_msg_size)
+{
+	IBatchCompletionState *cs;
+	unsigned size, p;
+	long ok = 0;
+
+	IStatus_init(status);
+	cs = IBatch_execute(batch, status, itra);
+	fb_batch_error_check(status);
+	if (!cs)
+		return -1;
+
+	size = IBatchCompletionState_getSize(cs, status);
+	for (p = 0; p < size; p++) {
+		int state = IBatchCompletionState_getState(cs, status, p);
+		if (state == IBatchCompletionState_EXECUTE_FAILED) {
+			IStatus *detail = IMaster_getStatus(fb_oo_master);
+			char text[1024];
+			if (detail) {
+				IBatchCompletionState_getStatus(cs, status, detail, p);
+				IUtil_formatStatus(fb_oo_util, text, sizeof(text) - 1, detail);
+				text[sizeof(text) - 1] = 0;
+				IStatus_dispose(detail);
+				snprintf(fail_msg, fail_msg_size, "record %u: %s", p, text);
+			}
+			else
+				snprintf(fail_msg, fail_msg_size, "record %u failed", p);
+			*fail_pos = p;
+			IBatchCompletionState_dispose(cs);
+			return -1;
+		}
+		if (state > 0)
+			ok += state;
+		else
+			ok++;			/* SUCCESS_NO_INFO: se ejecuto, sin conteo */
+	}
+	IBatchCompletionState_dispose(cs);
+	return ok;
+}
+
+/* Camino rapido para con.execute(sql, [fila1, fila2, ...]).
+   Devuelve las filas insertadas, o -1 si no aplica (el llamador usa el loop). */
+static long fb_cursor_execute_batch(struct FbCursor *fb_cursor, struct FbConnection *fb_connection,
+									VALUE filas)
+{
+	IStatus *status = fb_batch_status();
+	IStatement *istmt = NULL;
+	ITransaction *itra = NULL;
+	IMessageMetadata *meta = NULL;
+	IXpbBuilder *pb = NULL;
+	IBatch *batch = NULL;
+	FbBatchField *f;
+	struct tm tms;
+	char *buf = NULL;
+	char fail_msg[1200];
+	const char *pack_err = NULL;
+	unsigned nparams = 0, msg_len = 0, i;
+	long nrows, done = 0, inserted = 0;
+	size_t pending_bytes = 0;
+	int executed_any = 0;
+	int has_blob = 0;
+
+	if (!status)
+		return -1;
+
+	nrows = RARRAY_LEN(filas);
+	if (nrows < FB_BATCH_MIN_ROWS)
+		return -1;	/* una sola fila va mejor por el loop legacy */
+
+	/* 1) objetos OO a partir de los handles legacy */
+	if (fb_get_statement_interface(fb_connection->isc_status, &istmt, &fb_cursor->stmt) != 0 || !istmt)
+		return fb_batch_give_up(NULL, NULL, NULL, NULL, NULL);
+	if (fb_get_transaction_interface(fb_connection->isc_status, &itra, &fb_connection->transact) != 0 || !itra)
+		return fb_batch_give_up(istmt, NULL, NULL, NULL, NULL);
+
+	/* 2) metadata de los parametros de entrada */
+	IStatus_init(status);
+	meta = IStatement_getInputMetadata(istmt, status);
+	if (!meta || (IStatus_getState(status) & IStatus_STATE_ERRORS)) {
+		IStatus_init(status);
+		return fb_batch_give_up(istmt, itra, NULL, NULL, NULL);
+	}
+	nparams = IMessageMetadata_getCount(meta, status);
+	msg_len = IMessageMetadata_getMessageLength(meta, status);
+	{
+		/* Cada mensaje del buffer debe empezar en un limite alineado: si la
+		   longitud declarada no lo esta, hay que usar la alineada como paso
+		   (si no, el servidor lee los registros corridos). */
+		unsigned aligned = IMessageMetadata_getAlignedLength(meta, status);
+		if (aligned > msg_len)
+			msg_len = aligned;
+	}
+	if ((IStatus_getState(status) & IStatus_STATE_ERRORS) || nparams == 0 || msg_len == 0) {
+		IStatus_init(status);
+		return fb_batch_give_up(istmt, itra, meta, NULL, NULL);
+	}
+
+	f = (FbBatchField *) ALLOCA_N(FbBatchField, nparams);
+	for (i = 0; i < nparams; i++) {
+		unsigned noff = IMessageMetadata_getNullOffset(meta, status, i);
+		f[i].type = IMessageMetadata_getType(meta, status, i);
+		f[i].length = IMessageMetadata_getLength(meta, status, i);
+		f[i].offset = IMessageMetadata_getOffset(meta, status, i);
+		f[i].scale = IMessageMetadata_getScale(meta, status, i);
+		f[i].null_offset = noff;
+		f[i].has_null = (noff != (unsigned) -1);
+		switch (f[i].type) {
+		case SQL_VARYING: case SQL_TEXT:
+		case SQL_SHORT: case SQL_LONG: case SQL_INT64:
+		case SQL_FLOAT: case SQL_DOUBLE:
+		case SQL_TIMESTAMP: case SQL_TYPE_TIME: case SQL_TYPE_DATE:
+		case SQL_BOOLEAN: case SQL_INT128:
+			break;
+		case SQL_BLOB:
+			/* los blobs van por IBatch_addBlob; hay que declarar la politica
+			   en el BPB (mas abajo) */
+			has_blob = 1;
+			break;
+		default:
+			/* tipo que el batch no maneja: que lo haga el camino legacy */
+			IStatus_init(status);
+			return fb_batch_give_up(istmt, itra, meta, NULL, NULL);
+		}
+		if (IStatus_getState(status) & IStatus_STATE_ERRORS) {
+			IStatus_init(status);
+			return fb_batch_give_up(istmt, itra, meta, NULL, NULL);
+		}
+	}
+
+	/* Si alguna fila sola no entra en el lote, que se ocupe el camino legacy:
+	   ahi no hay buffer de batch y no hay limite (y todavia no se agrego nada
+	   al batch, asi que se puede abandonar limpiamente). */
+	if (has_blob) {
+		long r;
+		for (r = 0; r < nrows; r++) {
+			VALUE row = rb_ary_entry(filas, r);
+			if ((size_t) msg_len + fb_batch_row_blob_bytes(row, nparams, f) > FB_BATCH_MAX_ROW_BYTES)
+				return fb_batch_give_up(istmt, itra, meta, NULL, NULL);
+		}
+	}
+
+	/* 3) BPB + batch (el BPB se arma con IXpbBuilder; a mano no funciona) */
+	IStatus_init(status);
+	pb = IUtil_getXpbBuilder(fb_oo_util, status, IXpbBuilder_BATCH, NULL, 0);
+	if (!(IStatus_getState(status) & IStatus_STATE_ERRORS)) {
+		IXpbBuilder_insertInt(pb, status, IBatch_TAG_RECORD_COUNTS, 1);
+		IXpbBuilder_insertInt(pb, status, IBatch_TAG_BUFFER_BYTES_SIZE, (int) FB_BATCH_BUFFER_BYTES);
+		if (has_blob)
+			/* IBatch_BLOB_ID_ENGINE: el id lo genera la libreria cliente, y
+			   tiene que estar en el BPB antes de crear el batch. */
+			IXpbBuilder_insertInt(pb, status, IBatch_TAG_BLOB_POLICY, IBatch_BLOB_ID_ENGINE);
+	}
+	if (IStatus_getState(status) & IStatus_STATE_ERRORS) {
+		IStatus_init(status);
+		return fb_batch_give_up(istmt, itra, meta, pb, NULL);
+	}
+
+	IStatus_init(status);
+	batch = IStatement_createBatch(istmt, status, meta,
+								   IXpbBuilder_getBufferLength(pb, status),
+								   IXpbBuilder_getBuffer(pb, status));
+	if (!batch || (IStatus_getState(status) & IStatus_STATE_ERRORS)) {
+		IStatus_init(status);
+		return fb_batch_give_up(istmt, itra, meta, pb, NULL);
+	}
+
+	/* Los blobs del batch, por defecto, se guardan como "stream" (un solo
+	   segmento con todos los bytes); se pide el modo segmentado, que es el
+	   mismo que produce isc_create_blob2, para que el resto de los lectores
+	   (incluido el isc_get_segment de este driver) sigan viendo blobs
+	   normales. Hay que llamarlo antes de agregar mensajes o blobs. */
+	if (has_blob) {
+		static const unsigned char blob_bpb[] = {
+			isc_bpb_version1, isc_bpb_type, 1, isc_bpb_type_segmented
+		};
+		IStatus_init(status);
+		IBatch_setDefaultBpb(batch, status, sizeof(blob_bpb), blob_bpb);
+		if (IStatus_getState(status) & IStatus_STATE_ERRORS) {
+			IStatus_init(status);
+			return fb_batch_give_up(istmt, itra, meta, pb, batch);
+		}
+	}
+
+	/* 4) empaquetar y mandar */
+	buf = (char *) xmalloc((size_t) msg_len * FB_BATCH_ROWS_PER_ADD);
+	while (done < nrows) {
+		long cnt;
+		long k;
+		size_t group_bytes = 0;
+
+		/* Cuantas filas entran en este grupo: ni mas de FB_BATCH_ROWS_PER_ADD
+		   ni mas bytes de los que admite el buffer del lote (los blobs
+		   cuentan). */
+		for (cnt = 0; cnt < FB_BATCH_ROWS_PER_ADD && done + cnt < nrows; cnt++) {
+			VALUE row = rb_ary_entry(filas, done + cnt);
+			size_t row_bytes = (size_t) msg_len + fb_batch_row_blob_bytes(row, nparams, f);
+			if (cnt > 0 && group_bytes + row_bytes > FB_BATCH_FLUSH_BYTES)
+				break;
+			group_bytes += row_bytes;
+		}
+
+		/* Los blobs se mandan al empaquetar, no al IBatch_add: si lo pendiente
+		   mas este grupo no entra en el buffer, hay que vaciar antes. */
+		if (pending_bytes && pending_bytes + group_bytes > FB_BATCH_FLUSH_BYTES) {
+			long ok = fb_batch_execute_and_count(batch, itra, status, &i, fail_msg, sizeof(fail_msg));
+			if (ok < 0) {
+				xfree(buf);
+				fb_batch_give_up(istmt, itra, meta, pb, batch);
+				rb_raise(rb_eFbError, "batch failed: %s", fail_msg);
+			}
+			inserted += ok;
+			executed_any = 1;
+			pending_bytes = 0;
+		}
+
+		IStatus_init(status);
+		for (k = 0; k < cnt; k++) {
+			VALUE row = rb_ary_entry(filas, done + k);
+			char *msg = buf + (size_t) k * msg_len;
+			if (TYPE(row) != T_ARRAY || RARRAY_LEN(row) != (long) nparams) {
+				xfree(buf);
+				/* ya se ejecuto parte del lote: no se puede volver al loop */
+				if (executed_any) {
+					fb_batch_give_up(istmt, itra, meta, pb, batch);
+					rb_raise(rb_eFbError, "statement requires %d items; %ld given",
+							 (int) nparams, TYPE(row) == T_ARRAY ? RARRAY_LEN(row) : -1L);
+				}
+				return fb_batch_give_up(istmt, itra, meta, pb, batch);
+			}
+			memset(msg, 0, msg_len);
+			pack_err = fb_batch_pack_row(batch, status, msg, RARRAY_PTR(row), nparams, f, &tms);
+			if (pack_err)
+				break;
+		}
+		if (pack_err) {
+			xfree(buf);
+			if (executed_any) {
+				fb_batch_give_up(istmt, itra, meta, pb, batch);
+				rb_raise(rb_eFbError, "%s", pack_err);
+			}
+			return fb_batch_give_up(istmt, itra, meta, pb, batch);
+		}
+
+		IStatus_init(status);
+		IBatch_add(batch, status, (unsigned) cnt, buf);
+		if (IStatus_getState(status) & IStatus_STATE_ERRORS) {
+			IStatus *err = status;
+			if (!executed_any) {
+				IStatus_init(status);
+				xfree(buf);
+				return fb_batch_give_up(istmt, itra, meta, pb, batch);
+			}
+			xfree(buf);
+			fb_batch_error_check(err);
+			fb_batch_give_up(istmt, itra, meta, pb, batch);
+			rb_raise(rb_eFbError, "Firebird batch error");
+		}
+		done += cnt;
+		/* lo que ocupa el grupo en el buffer del lote: los mensajes y los
+		   blobs (que el servidor tambien cuenta) */
+		pending_bytes += group_bytes;
+	}
+
+	{
+		unsigned fail_pos = 0;
+		long ok = fb_batch_execute_and_count(batch, itra, status, &fail_pos, fail_msg, sizeof(fail_msg));
+		xfree(buf);
+		if (ok < 0) {
+			fb_batch_give_up(istmt, itra, meta, pb, batch);
+			rb_raise(rb_eFbError, "batch failed: %s", fail_msg);
+		}
+		inserted += ok;
+	}
+
+	fb_batch_give_up(istmt, itra, meta, pb, batch);
+	return inserted;
+}
+
+#endif /* FB_HAVE_BATCH_API */
+
+static long fb_cursor_execute_withparams(struct FbCursor *fb_cursor, long argc, VALUE *argv)
 {
 	struct FbConnection *fb_connection;
 
@@ -1938,6 +2766,14 @@ static void fb_cursor_execute_withparams(struct FbCursor *fb_cursor, long argc, 
 		VALUE obj;
 		VALUE ary = argv[0];
 		if (RARRAY_LEN(ary) > 0 && TYPE(RARRAY_PTR(ary)[0]) == T_ARRAY) {
+#ifdef FB_HAVE_BATCH_API
+			/* batch de protocolo: los N registros viajan en un solo round trip */
+			{
+				long batch_rows = fb_cursor_execute_batch(fb_cursor, fb_connection, ary);
+				if (batch_rows >= 0)
+					return batch_rows;
+			}
+#endif
 			for (i = 0; i < RARRAY_LEN(ary); i++) {
 				obj = rb_ary_entry(ary, i);
 				fb_cursor_execute_withparams(fb_cursor, 1, &obj);
@@ -1951,7 +2787,7 @@ static void fb_cursor_execute_withparams(struct FbCursor *fb_cursor, long argc, 
 				fb_cursor_set_inputparams(fb_cursor, RARRAY_LEN(obj), RARRAY_PTR(obj));
 
 				/* Execute SQL statement */
-				isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, SQLDA_VERSION1, fb_cursor->i_sqlda, NULL);
+				fb_stmt_execute2(fb_connection, &fb_cursor->stmt, fb_cursor->i_sqlda, NULL);
 				fb_error_check(fb_connection->isc_status);
 			}
 		}
@@ -1960,9 +2796,11 @@ static void fb_cursor_execute_withparams(struct FbCursor *fb_cursor, long argc, 
 		fb_cursor_set_inputparams(fb_cursor, argc, argv);
 
 		/* Execute SQL statement */
-		isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, SQLDA_VERSION1, fb_cursor->i_sqlda, NULL);
+		fb_stmt_execute2(fb_connection, &fb_cursor->stmt, fb_cursor->i_sqlda, NULL);
 		fb_error_check(fb_connection->isc_status);
 	}
+
+	return -1;	/* no se uso el batch */
 }
 
 static VALUE precision_from_sqlvar(XSQLVAR *sqlvar)
@@ -2163,11 +3001,19 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 		rb_raise(rb_eFbError, "Cursor is past end of data.");
 	}
 	/* Fetch one row */
-	if (isc_dsql_fetch(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda) == SQLCODE_NOMORE) {
-		fb_cursor->eof = Qtrue;
-		return Qnil;
+	if (fb_cursor->exec_procedure) {
+		if (fb_cursor->fetched) {
+			fb_cursor->eof = Qtrue;
+			return Qnil;
+		}
+		fb_cursor->fetched = 1;
+	} else {
+		if (fb_stmt_fetch(fb_connection, &fb_cursor->stmt, fb_cursor->o_sqlda) == SQLCODE_NOMORE) {
+			fb_cursor->eof = Qtrue;
+			return Qnil;
+		}
+		fb_error_check(fb_connection->isc_status);
 	}
-	fb_error_check(fb_connection->isc_status);
 
 	/* Create the result tuple object */
 	cols = fb_cursor->o_sqlda->sqld;
@@ -2188,7 +3034,9 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 				case SQL_TEXT:
 					val = rb_str_new(var->sqldata, var->sqllen);
 					#if HAVE_RUBY_ENCODING_H
-					rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					if (!NIL_P(fb_connection->encoding)) {
+						rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					}
 					#endif
 					break;
 
@@ -2196,7 +3044,9 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 					vary = (VARY*)var->sqldata;
 					val = rb_str_new(vary->vary_string, vary->vary_length);
 					#if HAVE_RUBY_ENCODING_H
-					rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					if (!NIL_P(fb_connection->encoding)) {
+						rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					}
 					#endif
 					break;
 
@@ -2236,21 +3086,6 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 					isc_decode_timestamp((ISC_TIMESTAMP *)var->sqldata, &tms);
 					val = fb_mktime(&tms, "local");
 					break;
-
-#if (FB_API_VER >= 40)
-				case SQL_TIMESTAMP_WITH_TZ:
-					{
-						ISC_TIMESTAMP_WITH_TZ *ts_tz = (ISC_TIMESTAMP_WITH_TZ *)var->sqldata;
-						isc_decode_timestamp(&(ts_tz->timestamp), &tms);
-						/* The time_zone field is a key to the RDB$TIME_ZONES table.
-						   For now, we can't easily look it up.
-						   Firebird 4.0 API has isc_decode_timestamp_with_tz which gives offset.
-						   Without it, we assume UTC as a fallback.
-						   A proper implementation would query RDB$TIME_ZONES. */
-						val = fb_mktime(&tms, "utc");
-					}
-					break;
-#endif
 
 				case SQL_TYPE_TIME:
 					isc_decode_sql_time((ISC_TIME *)var->sqldata, &tms);
@@ -2297,7 +3132,9 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 						fb_error_check(fb_connection->isc_status);
 					}
 					#if HAVE_RUBY_ENCODING_H
-					rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					if (!NIL_P(fb_connection->encoding)) {
+						rb_funcall(val, id_force_encoding, 1, fb_connection->encoding);
+					}
 					#endif
 					isc_close_blob(fb_connection->isc_status, &blob_handle);
 					fb_error_check(fb_connection->isc_status);
@@ -2308,22 +3145,47 @@ static VALUE fb_cursor_fetch(struct FbCursor *fb_cursor)
 					val = Qnil;
 					break;
 
-#if (FB_API_VER >= 40)
-				case SQL_INT128:
-					/* Treat as 64-bit integer for now */
+				case SQL_INT128: {
+					VALUE unscaled = fb_int128_read(var->sqldata);
 					if (var->sqlscale < 0) {
-						val = sql_decimal_to_bigdecimal(*(ISC_INT64*)var->sqldata, var->sqlscale);
+						/* NUMERIC/DECIMAL de hasta 38 digitos -> BigDecimal */
+						VALUE div = rb_funcall(INT2FIX(10), rb_intern("**"), 1, INT2FIX(-var->sqlscale));
+						val = rb_funcall(rb_funcall(rb_cObject, rb_intern("BigDecimal"), 1, unscaled),
+										 rb_intern("/"), 1, div);
 					} else {
-						val = LL2NUM(*(ISC_INT64*)var->sqldata);
+						val = unscaled;
 					}
 					break;
-#endif
+				}
 
-#if (FB_API_VER >= 30)
 				case SQL_BOOLEAN:
 					val = (*(bool*)var->sqldata) ? Qtrue : Qfalse;
 					break;
-#endif
+
+				case SQL_TIMESTAMP_TZ:
+				case SQL_TIMESTAMP_TZ_EX:
+					/* En los tipos con zona el servidor manda el instante en UTC
+					   (la zona va aparte, en el mismo campo de 12 bytes), asi que
+					   se construye el Time en UTC: ponerlo como local desplazaba
+					   el instante por el offset local. */
+					isc_decode_timestamp((ISC_TIMESTAMP *)var->sqldata, &tms);
+					val = fb_mktime(&tms, "utc");
+					break;
+
+				case SQL_TIME_TZ:
+				case SQL_TIME_TZ_EX:
+					isc_decode_sql_time((ISC_TIME *)var->sqldata, &tms);
+					tms.tm_year = 100;
+					tms.tm_mon = 0;
+					tms.tm_mday = 1;
+					val = fb_mktime(&tms, "utc");
+					break;
+
+				case SQL_DEC16:
+				case SQL_DEC34:
+					rb_warn("DECFLOAT not supported (yet)");
+					val = Qnil;
+					break;
 
 				default:
 					rb_raise(rb_eFbError, "Specified table includes unsupported datatype (%ld)", dtp);
@@ -2396,6 +3258,7 @@ static VALUE cursor_execute2(VALUE args)
 	VALUE result = Qnil;
 	char isc_info_buff[16];
 	char isc_info_stmt[] = { isc_info_sql_stmt_type };
+	struct FbStmtCache *cache_entry;
 
 	VALUE self = rb_ary_pop(args);
 	TypedData_Get_Struct(self, struct FbCursor, &fbcursor_data_type, fb_cursor);
@@ -2404,38 +3267,96 @@ static VALUE cursor_execute2(VALUE args)
 	rb_sql = rb_ary_shift(args);
 	sql = StringValuePtr(rb_sql);
 
-	/* Prepare query */
-	isc_dsql_prepare(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, 0, sql, fb_connection_dialect(fb_connection), fb_cursor->o_sqlda);
-	fb_error_check(fb_connection->isc_status);
-
-	/* Get the statement type */
-	isc_dsql_sql_info(fb_connection->isc_status, &fb_cursor->stmt,
-			sizeof(isc_info_stmt), isc_info_stmt,
-			sizeof(isc_info_buff), isc_info_buff);
-	fb_error_check(fb_connection->isc_status);
-
-	if (isc_info_buff[0] == isc_info_sql_stmt_type) {
-		length = isc_vax_integer(&isc_info_buff[1], 2);
-		statement = isc_vax_integer(&isc_info_buff[3], (short)length);
-	} else {
-		statement = 0;
-	}
-	/* Describe the parameters */
-	isc_dsql_describe_bind(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->i_sqlda);
-	fb_error_check(fb_connection->isc_status);
-
-	isc_dsql_describe(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda);
-	fb_error_check(fb_connection->isc_status);
-
-	/* Get the number of parameters and reallocate the SQLDA */
-	in_params = fb_cursor->i_sqlda->sqld;
-	if (fb_cursor->i_sqlda->sqln < in_params) {
+	/* Cache: si este SQL ya esta preparado y libre, se reutiliza (ahorra
+	   prepare + describe_bind + describe, tres idas y vueltas al servidor). */
+	cache_entry = fb_stmt_cache_find(fb_connection, sql);
+	if (cache_entry) {
+		/* la sentencia recien asignada a este cursor no se usa */
+		isc_dsql_free_statement(fb_connection->isc_status, &fb_cursor->stmt, DSQL_drop);
+		fb_error_check_warn(fb_connection->isc_status);
 		xfree(fb_cursor->i_sqlda);
-		fb_cursor->i_sqlda = sqlda_alloc(in_params);
-		/* Describe again */
+		xfree(fb_cursor->o_sqlda);
+		fb_cursor->stmt = cache_entry->stmt;
+		fb_cursor->i_sqlda = cache_entry->i_sqlda;
+		fb_cursor->o_sqlda = cache_entry->o_sqlda;
+		fb_cursor->cache = cache_entry;
+		cache_entry->in_use = 1;
+		fb_cursor_pin(fb_connection, self);
+		statement = cache_entry->statement_type;
+	} else {
+		/* Prepare query */
+		isc_dsql_prepare(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, 0, sql, fb_connection_dialect(fb_connection), fb_cursor->o_sqlda);
+		fb_error_check(fb_connection->isc_status);
+
+		/* Get the statement type */
+		isc_dsql_sql_info(fb_connection->isc_status, &fb_cursor->stmt,
+				sizeof(isc_info_stmt), isc_info_stmt,
+				sizeof(isc_info_buff), isc_info_buff);
+		fb_error_check(fb_connection->isc_status);
+
+		if (isc_info_buff[0] == isc_info_sql_stmt_type) {
+			length = isc_vax_integer(&isc_info_buff[1], 2);
+			statement = isc_vax_integer(&isc_info_buff[3], (short)length);
+		} else {
+			statement = 0;
+		}
+		/* Describe the parameters */
 		isc_dsql_describe_bind(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->i_sqlda);
 		fb_error_check(fb_connection->isc_status);
+
+		isc_dsql_describe(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda);
+		fb_error_check(fb_connection->isc_status);
+
+		/* Get the number of parameters and reallocate the SQLDA */
+		in_params = fb_cursor->i_sqlda->sqld;
+		if (fb_cursor->i_sqlda->sqln < in_params) {
+			xfree(fb_cursor->i_sqlda);
+			fb_cursor->i_sqlda = sqlda_alloc(in_params);
+			/* Describe again */
+			isc_dsql_describe_bind(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->i_sqlda);
+			fb_error_check(fb_connection->isc_status);
+		}
+
+		/* El SQLDA de salida tiene que tener ya su tamano definitivo ANTES de
+		   entrar en la cache: la entrada guarda el puntero a los dos SQLDA
+		   (fb_stmt_cache_add) y, si despues se reemplazara por uno mayor, la
+		   entrada quedaria apuntando a memoria liberada. Con mas de
+		   SQLDA_COLSINIT columnas eso daba, en la segunda ejecucion del mismo
+		   SQL, un resultado incorrecto (query devolvia 0 en lugar de las filas)
+		   o directamente la caida del proceso (doble free / desbordamiento). */
+		cols = fb_cursor->o_sqlda->sqld;
+		if (fb_cursor->o_sqlda->sqln < cols) {
+			xfree(fb_cursor->o_sqlda);
+			fb_cursor->o_sqlda = sqlda_alloc(cols);
+			/* Describe again */
+			isc_dsql_describe(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda);
+			fb_error_check(fb_connection->isc_status);
+		}
+
+		/* Registrar en la cache. El DDL invalida lo cacheado; si la cache esta
+		   llena y todo en uso, fb_cursor->cache queda NULL y este cursor es
+		   dueno de su sentencia, exactamente como antes. */
+		if (statement == isc_info_sql_stmt_ddl)
+			fb_stmt_cache_invalidate(fb_connection);
+		else {
+			fb_cursor->cache = fb_stmt_cache_add(fb_connection, fb_cursor, sql, statement, self);
+			if (fb_cursor->cache)
+				fb_cursor_pin(fb_connection, self);
+		}
 	}
+
+	/* siempre, tambien en el camino de cache (antes quedaba sin inicializar) */
+	in_params = fb_cursor->i_sqlda->sqld;
+
+	/* El timeout se aplica siempre: la sentencia cacheada pudo prepararse antes
+	   de que se cambiara command_timeout. */
+#ifdef HAVE_FB_DSQL_SET_TIMEOUT
+	if (fb_connection->command_timeout_ms > 0) {
+		fb_dsql_set_timeout(fb_connection->isc_status, &fb_cursor->stmt,
+							(ISC_ULONG) fb_connection->command_timeout_ms);
+		fb_error_check(fb_connection->isc_status);
+	}
+#endif
 
     /* Get the size of parameters buffer and reallocate it */
 	if (in_params) {
@@ -2456,16 +3377,23 @@ static VALUE cursor_execute2(VALUE args)
 		} else if (statement == isc_info_sql_stmt_rollback) {
 			rb_raise(rb_eFbError, "use Fb::Connection#rollback()");
 		} else if (in_params) {
-			fb_cursor_execute_withparams(fb_cursor, RARRAY_LEN(args), RARRAY_PTR(args));
+			long batch_rows = fb_cursor_execute_withparams(fb_cursor, RARRAY_LEN(args), RARRAY_PTR(args));
+			if (batch_rows >= 0) {
+				/* el batch ya conto las filas afectadas */
+				result = INT2NUM((int) batch_rows);
+				return result;
+			}
 		} else {
-			isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, SQLDA_VERSION1, NULL, NULL);
+			fb_stmt_execute2(fb_connection, &fb_cursor->stmt, NULL, NULL);
 			fb_error_check(fb_connection->isc_status);
 		}
 		rows_affected = cursor_rows_affected(fb_cursor, statement);
 		result = INT2NUM((int)rows_affected);
 	} else {
 		/* Open cursor if the SQL statement is query */
-		/* Get the number of columns and reallocate the SQLDA */
+		/* Get the number of columns and reallocate the SQLDA. Ya se hizo al
+		   preparar (antes de registrar en la cache); esto queda como red de
+		   seguridad por si un SQLDA cacheado viniera corto. */
 		cols = fb_cursor->o_sqlda->sqld;
 		if (fb_cursor->o_sqlda->sqln < cols) {
 			xfree(fb_cursor->o_sqlda);
@@ -2473,180 +3401,57 @@ static VALUE cursor_execute2(VALUE args)
 			/* Describe again */
 			isc_dsql_describe(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda);
 			fb_error_check(fb_connection->isc_status);
+			/* Si el SQLDA venia de la cache, la entrada lo comparte: hay que
+			   dejarla apuntando al nuevo, no al liberado. */
+			if (fb_cursor->cache)
+				fb_cursor->cache->o_sqlda = fb_cursor->o_sqlda;
 		}
 
 		if (in_params) {
 			fb_cursor_set_inputparams(fb_cursor, RARRAY_LEN(args), RARRAY_PTR(args));
 		}
 
-		/* Open cursor */
-		isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, SQLDA_VERSION1, in_params ? fb_cursor->i_sqlda : NULL, NULL);
-		fb_error_check(fb_connection->isc_status);
-		fb_cursor->open = Qtrue;
+		int is_query = (statement == isc_info_sql_stmt_select || statement == isc_info_sql_stmt_select_for_upd);
+		fb_cursor->exec_procedure = !is_query;
+		fb_cursor->fetched = 0;
 
-		/* Get the size of results buffer and reallocate it */
-		length = calculate_buffsize(fb_cursor->o_sqlda);
-		if (length > fb_cursor->o_buffer_size) {
-			/* allocate a bit of headroom to avoid overruns from client writes
-			   and zero the buffer so unused bytes are predictable */
-			long alloc_len = length + 64; /* headroom; adjust if needed */
-			fb_cursor->o_buffer = xrealloc(fb_cursor->o_buffer, alloc_len);
-			memset(fb_cursor->o_buffer, 0, alloc_len);
-			fb_cursor->o_buffer_size = alloc_len;
+		if (fb_cursor->exec_procedure) {
+			/* Allocate output buffer first, as isc_dsql_execute2 will write to it immediately */
+			length = calculate_buffsize(fb_cursor->o_sqlda);
+			if (length > fb_cursor->o_buffer_size) {
+				fb_cursor->o_buffer = xrealloc(fb_cursor->o_buffer, length);
+				fb_cursor->o_buffer_size = length;
+			}
+			/* Set output sqldata/sqlind pointers */
+			fb_cursor->open = Qtrue; /* Temporarily set to true so fetch_prep doesn't raise error */
+			fb_cursor_fetch_prep(fb_cursor);
+
+			/* Execute and retrieve output parameters immediately */
+			fb_stmt_execute2(fb_connection, &fb_cursor->stmt, in_params ? fb_cursor->i_sqlda : NULL, fb_cursor->o_sqlda);
+			fb_error_check(fb_connection->isc_status);
+		} else {
+			/* Open cursor */
+			fb_stmt_execute2(fb_connection, &fb_cursor->stmt, in_params ? fb_cursor->i_sqlda : NULL, NULL);
+			fb_error_check(fb_connection->isc_status);
+			fb_cursor->open = Qtrue;
+
+			/* Get the size of results buffer and reallocate it */
+			length = calculate_buffsize(fb_cursor->o_sqlda);
+			if (length > fb_cursor->o_buffer_size) {
+				fb_cursor->o_buffer = xrealloc(fb_cursor->o_buffer, length);
+				fb_cursor->o_buffer_size = length;
+			}
 		}
-        /* Set the description attributes */
-        fb_cursor->fields_ary = fb_cursor_fields_ary(fb_cursor->o_sqlda, fb_connection->downcase_names);
-        fb_cursor->fields_hash = fb_cursor_fields_hash(fb_cursor->fields_ary);
-    }
-    return result;
-}
 
-static void fb_cursor_prepare_output_buffers(struct FbCursor *fb_cursor)
-{
-    long length;
-
-    /* Get the size of results buffer and reallocate it */
-    length = calculate_buffsize(fb_cursor->o_sqlda);
-	if (length > fb_cursor->o_buffer_size) {
-		/* Reserve small headroom to satisfy client library writes and alignment */
-		long alloc_len = length + 64;
-		fb_cursor->o_buffer = xrealloc(fb_cursor->o_buffer, alloc_len);
-		memset(fb_cursor->o_buffer, 0, alloc_len);
-		fb_cursor->o_buffer_size = alloc_len;
+		/* Set the description attributes */
+		fb_cursor->fields_ary = fb_cursor_fields_ary(fb_cursor->o_sqlda, fb_connection->downcase_names);
+		fb_cursor->fields_hash = fb_cursor_fields_hash(fb_cursor->fields_ary);
 	}
-
-	/* Set the output SQLDA pointers */
-	long cols = fb_cursor->o_sqlda->sqld;
-	XSQLVAR *var;
-	long offset;
-	long count;
-	for (var = fb_cursor->o_sqlda->sqlvar, offset = 0, count = 0; count < cols; var++, count++) {
-		long alignment = var->sqllen;
-		length = var->sqllen;
-		if ((var->sqltype & ~1) == SQL_VARYING) {
-			length += sizeof(short);
-		}
-		offset = FB_ALIGN(offset, alignment);
-		var->sqldata = (char*)(fb_cursor->o_buffer + offset);
-		offset += length;
-		var->sqlind = (short*)(fb_cursor->o_buffer + FB_ALIGN(offset, sizeof(short)));
-	}
-}
-
-/* Función para ejecución con RETURNING (cursor_execute2_returning original) */
-/* Función para ejecución con RETURNING (cursor_execute2_returning original) */
-static VALUE cursor_execute2_returning(VALUE args)
-{
-    struct FbCursor *fb_cursor;
-    struct FbConnection *fb_connection;
-    char *sql;
-    VALUE rb_sql;
-    long in_params;
-    ISC_STATUS fetch_stat;
-    int is_insert = 0;
-    VALUE result = rb_ary_new();
-    int row_count = 0;
-
-    VALUE self = rb_ary_pop(args);
-    TypedData_Get_Struct(self, struct FbCursor, &fbcursor_data_type, fb_cursor);
-    TypedData_Get_Struct(fb_cursor->connection, struct FbConnection, &fbconnection_data_type, fb_connection);
-
-    rb_sql = rb_ary_shift(args);
-    sql = StringValuePtr(rb_sql);
-
-    // 1. Preparar
-    isc_dsql_prepare(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt, 0, sql,
-                     fb_connection_dialect(fb_connection), fb_cursor->o_sqlda);
-    if (fb_connection->isc_status[1]) goto cleanup;
-
-    // 2. Describir bind y output
-    isc_dsql_describe_bind(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->i_sqlda);
-    if (fb_connection->isc_status[1]) goto cleanup;
-    isc_dsql_describe(fb_connection->isc_status, &fb_cursor->stmt, 1, fb_cursor->o_sqlda);
-    if (fb_connection->isc_status[1]) goto cleanup;
-
-    if (fb_cursor->o_sqlda->sqld == 0) {
-        rb_raise(rb_eFbError, "execute_with_returning requires a RETURNING clause");
-    }
-
-    // 3. Parámetros de entrada
-    in_params = fb_cursor->i_sqlda->sqld;
-    if (in_params > 0) {
-        long len = calculate_buffsize(fb_cursor->i_sqlda);
-        if (len > fb_cursor->i_buffer_size) {
-            fb_cursor->i_buffer = xrealloc(fb_cursor->i_buffer, len + 64);
-            memset(fb_cursor->i_buffer, 0, len + 64);
-            fb_cursor->i_buffer_size = len + 64;
-        }
-        fb_cursor_set_inputparams(fb_cursor, RARRAY_LEN(args), RARRAY_PTR(args));
-    }
-
-    // 4. Preparar buffers de salida
-    fb_cursor_prepare_output_buffers(fb_cursor);
-
-    // 5. Determinar si es INSERT (miramos los primeros caracteres en mayúsculas)
-    {
-        char up[7] = {0};
-        for (int i = 0; i < 6 && sql[i]; i++) {
-            up[i] = UPPER(sql[i]);
-        }
-        is_insert = (strncmp(up, "INSERT", 6) == 0);
-    }
-
-    // 6. Ejecutar según tipo
-    if (is_insert) {
-        // INSERT: usar execute2 (más rápido y correcto)
-        isc_dsql_execute2(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt,
-                          SQLDA_VERSION1,
-                          in_params ? fb_cursor->i_sqlda : NULL,
-                          fb_cursor->o_sqlda);
-        if (fb_connection->isc_status[1]) goto cleanup;
-
-        // Si hay datos en el SQLDA → hay fila retornada
-        if (fb_cursor->o_sqlda->sqld > 0 &&
-            fb_cursor->o_sqlda->sqlvar[0].sqlind &&
-            *(fb_cursor->o_sqlda->sqlvar[0].sqlind) != -1) {
-            VALUE row = fb_convert_row_to_ruby(fb_cursor);
-            if (NIL_P(fb_cursor->fields_ary)) {
-                fb_cursor->fields_ary = fb_cursor_fields_ary(fb_cursor->o_sqlda, fb_connection->downcase_names);
-                fb_cursor->fields_hash = fb_cursor_fields_hash(fb_cursor->fields_ary);
-            }
-            rb_ary_push(result, fb_hash_from_ary(fb_cursor->fields_ary, row));
-            row_count = 1;
-        }
-    } else {
-        // UPDATE o DELETE: usar execute + fetch (soporta multi-fila)
-        isc_dsql_execute(fb_connection->isc_status, &fb_connection->transact, &fb_cursor->stmt,
-                         SQLDA_VERSION1, in_params ? fb_cursor->i_sqlda : NULL);
-        if (fb_connection->isc_status[1]) goto cleanup;
-
-        while ((fetch_stat = isc_dsql_fetch(fb_connection->isc_status, &fb_cursor->stmt,
-                                            SQLDA_VERSION1, fb_cursor->o_sqlda)) == 0) {
-            VALUE row = fb_convert_row_to_ruby(fb_cursor);
-            if (NIL_P(fb_cursor->fields_ary)) {
-                fb_cursor->fields_ary = fb_cursor_fields_ary(fb_cursor->o_sqlda, fb_connection->downcase_names);
-                fb_cursor->fields_hash = fb_cursor_fields_hash(fb_cursor->fields_ary);
-            }
-            rb_ary_push(result, fb_hash_from_ary(fb_cursor->fields_ary, row));
-            row_count++;
-        }
-
-        // 100 = no more rows → normal
-        if (fetch_stat != 100L && fb_connection->isc_status[1]) {
-            goto cleanup;
-        }
-    }
-
-    // 7. Siempre devolver un array, incluso si está vacío
-    return result;
-
-cleanup:
-    fb_error_check(fb_connection->isc_status);
-    return rb_ary_new(); // En caso de error, devolver array vacío
+	return result;
 }
 
 /* call-seq:
- *   execute(sql, *args) -> nil or rows affected or Array of Hashes or Cursor
+ *   execute(sql, *args) -> nil or rows affected
  *
  * This function is no longer published.
  */
@@ -2655,10 +3460,6 @@ static VALUE cursor_execute(int argc, VALUE* argv, VALUE self)
 	struct FbCursor *fb_cursor;
 	struct FbConnection *fb_connection;
 	VALUE args;
-	VALUE result = Qnil;
-	char *sql;
-	VALUE rb_sql;
-	int has_returning = 0;
 
 	if (argc < 1) {
 		rb_raise(rb_eArgError, "At least 1 argument required.");
@@ -2677,85 +3478,25 @@ static VALUE cursor_execute(int argc, VALUE* argv, VALUE self)
 		fb_cursor->open = Qfalse;
 	}
 
-	// Obtener el SQL y verificar si tiene cláusula RETURNING
-	rb_sql = rb_ary_entry(args, 0);
-	sql = StringValuePtr(rb_sql);
-	
-	// Detectar si tiene cláusula RETURNING (case insensitive)
-	{
-		size_t sql_len = strlen(sql);
-		char *sql_upper = ALLOCA_N(char, sql_len + 1);
-		char *p = sql_upper;
-		const char *s = sql;
-		
-		// Convertir a mayúsculas de forma segura
-		while (*s) {
-			unsigned char c = (unsigned char)*s;
-			// Solo convertir caracteres ASCII, dejar otros intactos
-			if (c >= 'a' && c <= 'z') {
-				*p++ = c - 'a' + 'A';
-			} else {
-				*p++ = c;
-			}
-			s++;
-		}
-		*p = '\0';
-		
-		has_returning = (strstr(sql_upper, "RETURNING") != NULL);
-	}
-
 	if (!fb_connection->transact) {
+		VALUE result;
 		int state;
 
 		fb_connection_transaction_start(fb_connection, Qnil);
 		fb_cursor->auto_transact = fb_connection->transact;
 
-		if (has_returning) {
-			// Ejecutar con RETURNING - devuelve array directamente
-			result = rb_protect((VALUE(*)(VALUE))cursor_execute2_returning, args, &state);
-			if (state) {
-				fb_connection_rollback(fb_connection);
-				rb_jump_tag(state);
-			}
-			// Para RETURNING, hacemos commit y devolvemos el array
+		result = rb_protect(cursor_execute2, args, &state);
+		if (state) {
+			fb_connection_rollback(fb_connection);
+			return rb_funcall(rb_mKernel, rb_intern("raise"), 0);
+		} else if (result != Qnil) {
 			fb_connection_commit(fb_connection);
 			return result;
 		} else {
-			// Ejecutar normal (cursor_execute2 original)
-			result = rb_protect((VALUE(*)(VALUE))cursor_execute2, args, &state);
-			if (state) {
-				fb_connection_rollback(fb_connection);
-				rb_jump_tag(state);
-			}
-
-			// IMPORTANTE: Mantener el comportamiento original
-			// Si cursor_execute2 devuelve Qnil, significa que es un SELECT
-			// y debemos devolver el cursor (self)
-			if (NIL_P(result)) {
-				return self; // Devuelve cursor para SELECT
-			} else {
-				// Si es DML, commit la transacción y devuelve filas afectadas
-				fb_connection_commit(fb_connection);
-				return result;
-			}
-		}
-		
-	} else {
-		// Ya hay una transacción activa
-		if (has_returning) {
-			result = cursor_execute2_returning(args);
-			// Para RETURNING con transacción existente, devolvemos el array resultante
 			return result;
-		} else {
-			result = cursor_execute2(args);
-			// Para consultas normales, mantener el comportamiento original
-			// Si es Qnil, devolver el cursor (self)
-			if (NIL_P(result)) {
-				return self; // Devuelve cursor para SELECT
-			} else {
-				return result; // Devuelve filas afectadas para DML
-			}
 		}
+	} else {
+		return cursor_execute2(args);
 	}
 }
 
@@ -2891,12 +3632,30 @@ static VALUE cursor_close(VALUE self)
 
 	/* Close the cursor */
 	if (fb_cursor->stmt) {
+		/* Si este cursor es el dueno de la entrada (su campo stmt es la direccion
+		   que Firebird se guardo para esa sentencia), tiene que seguir anclado
+		   hasta que la entrada se destruya: ver fb_stmt_cache_destroy. */
+		int keep_pin = (fb_cursor->cache != NULL &&
+			((struct FbStmtCache *) fb_cursor->cache)->owner == self);
 		isc_dsql_free_statement(fb_connection->isc_status, &fb_cursor->stmt, DSQL_close);
 		fb_error_check_warn(fb_connection->isc_status);
-		isc_dsql_free_statement(fb_connection->isc_status, &fb_cursor->stmt, DSQL_drop);
-		fb_error_check(fb_connection->isc_status);
+		if (fb_cursor->cache) {
+			/* la sentencia queda en la cache para reutilizarla */
+			fb_stmt_cache_release(fb_connection, fb_cursor);
+		} else {
+			isc_dsql_free_statement(fb_connection->isc_status, &fb_cursor->stmt, DSQL_drop);
+			fb_error_check(fb_connection->isc_status);
+			/* handle muerto: que nadie lo vuelva a dropear (un segundo drop escribe
+			   sobre memoria ya liberada por el cliente -> segfault en el GC) */
+			fb_cursor->stmt = 0;
+		}
+		if (!keep_pin)
+			fb_cursor_unpin(fb_connection, self);
 		fb_cursor->open = Qfalse;
-		if (fb_connection->transact == fb_cursor->auto_transact) {
+		/* Solo si hay transaccion activa Y la abrio este cursor: si otro cursor
+		   de la misma transaccion automatica ya la comiteo, transact == 0 y
+		   comitear de nuevo fallaba con "invalid transaction handle". */
+		if (fb_connection->transact && fb_connection->transact == fb_cursor->auto_transact) {
 			isc_commit_transaction(fb_connection->isc_status, &fb_connection->transact);
 			fb_cursor->auto_transact = fb_connection->transact;
 			fb_error_check(fb_connection->isc_status);
@@ -2966,7 +3725,6 @@ static VALUE cursor_fields(int argc, VALUE* argv, VALUE self)
  */
 static VALUE error_error_code(VALUE error)
 {
-	rb_p(error);
 	return rb_iv_get(error, "error_code");
 }
 
@@ -3039,6 +3797,7 @@ static VALUE connection_create(isc_db_handle handle, VALUE db)
 	fb_connection->db = handle;
 	fb_connection->transact = 0;
 	fb_connection->cursor = rb_ary_new();
+	fb_connection->cached_cursors = rb_ary_new();
 	dialect = SQL_DIALECT_CURRENT;
 	db_dialect = fb_connection_db_SQL_Dialect(fb_connection);
 
@@ -3052,6 +3811,10 @@ static VALUE connection_create(isc_db_handle handle, VALUE db)
 	downcase_names = rb_iv_get(db, "@downcase_names");
 	fb_connection->downcase_names = RTEST(downcase_names);
 	fb_connection->encoding = rb_iv_get(db, "@encoding");
+	{
+		VALUE timeout = rb_iv_get(db, "@command_timeout");
+		fb_connection->command_timeout_ms = NIL_P(timeout) ? 0 : (long) (NUM2DBL(timeout) * 1000.0);
+	}
 
 	for (i = 0; (parm = CONNECTION_PARMS[i]); i++) {
 		rb_iv_set(connection, parm, rb_iv_get(db, parm));
@@ -3398,6 +4161,9 @@ static VALUE database_initialize(int argc, VALUE *argv, VALUE self)
 		rb_iv_set(self, "@downcase_names", rb_hash_aref(parms, ID2SYM(rb_intern("downcase_names"))));
 		rb_iv_set(self, "@encoding", default_string(parms, "encoding", "ASCII-8BIT"));
 		rb_iv_set(self, "@page_size", default_int(parms, "page_size", 4096));
+		rb_iv_set(self, "@command_timeout", rb_hash_aref(parms, ID2SYM(rb_intern("command_timeout"))));
+	} else {
+		rb_iv_set(self, "@encoding", rb_str_new2("ASCII-8BIT"));
 	}
 	return self;
 }
@@ -3541,8 +4307,22 @@ static VALUE database_s_drop(int argc, VALUE *argv, VALUE klass)
 	return database_drop(obj);
 }
 
+/* Helper: activate bigdecimal gem (needed for Ruby 3.4+ where it's not a default gem) */
+static VALUE fb_activate_gem(VALUE arg)
+{
+	rb_funcall(rb_mKernel, rb_intern("gem"), 1, rb_str_new2("bigdecimal"));
+	return Qnil;
+}
+
+static VALUE fb_gem_error(VALUE arg, VALUE exc)
+{
+	return Qnil;  /* gem activation failure is harmless on older Ruby */
+}
+
 void Init_fb()
 {
+	/* Ruby 3.4+ requires explicit gem activation before require for bundled gems */
+	rb_rescue(fb_activate_gem, Qnil, fb_gem_error, Qnil);
 	rb_funcall(rb_mKernel, rb_intern("require"), 1, rb_str_new2("bigdecimal"));
 
 	rb_mFb = rb_define_module("Fb");
@@ -3559,6 +4339,7 @@ void Init_fb()
 	rb_define_attr(rb_cFbDatabase, "downcase_names", 1, 1);
 	rb_define_attr(rb_cFbDatabase, "encoding", 1, 1);
 	rb_define_attr(rb_cFbDatabase, "page_size", 1, 1);
+	rb_define_attr(rb_cFbDatabase, "command_timeout", 1, 1);
     rb_define_method(rb_cFbDatabase, "create", database_create, 0);
 	rb_define_singleton_method(rb_cFbDatabase, "create", database_s_create, -1);
 	rb_define_method(rb_cFbDatabase, "connect", database_connect, 0);
@@ -3578,12 +4359,15 @@ void Init_fb()
 	rb_define_attr(rb_cFbConnection, "encoding", 1, 1);
 	rb_define_method(rb_cFbConnection, "to_s", connection_to_s, 0);
 	rb_define_method(rb_cFbConnection, "execute", connection_execute, -1);
-	//rb_define_method(rb_cFbConnection, "execute_with_returning", connection_execute_with_returning, -1);
 	rb_define_method(rb_cFbConnection, "query", connection_query, -1);
 	rb_define_method(rb_cFbConnection, "transaction", connection_transaction, -1);
 	rb_define_method(rb_cFbConnection, "transaction_started", connection_transaction_started, 0);
 	rb_define_method(rb_cFbConnection, "commit", connection_commit, 0);
 	rb_define_method(rb_cFbConnection, "rollback", connection_rollback, 0);
+	rb_define_method(rb_cFbConnection, "encoding=", connection_set_encoding, 1);
+	rb_define_method(rb_cFbConnection, "command_timeout", connection_command_timeout, 0);
+	rb_define_method(rb_cFbConnection, "command_timeout=", connection_set_command_timeout, 1);
+	rb_define_method(rb_cFbConnection, "cancel", connection_cancel, 0);
 	rb_define_method(rb_cFbConnection, "close", connection_close, 0);
 	rb_define_method(rb_cFbConnection, "drop", connection_drop, 0);
 	rb_define_method(rb_cFbConnection, "open?", connection_is_open, 0);
@@ -3617,6 +4401,13 @@ void Init_fb()
 
 	rb_eFbError = rb_define_class_under(rb_mFb, "Error", rb_eStandardError);
 	rb_define_method(rb_eFbError, "error_code", error_error_code, 0);
+
+	/* constantes de INT128: 2**128 y 2**64-1 */
+	fb_int128_modulus = rb_funcall(INT2FIX(2), rb_intern("**"), 1, INT2FIX(128));
+	rb_global_variable(&fb_int128_modulus);
+	fb_int128_lomask = rb_funcall(INT2FIX(2), rb_intern("**"), 1, INT2FIX(64));
+	fb_int128_lomask = rb_funcall(fb_int128_lomask, rb_intern("-"), 1, INT2FIX(1));
+	rb_global_variable(&fb_int128_lomask);
 
 	rb_sFbField = rb_struct_define("FbField", "name", "sql_type", "sql_subtype", "display_size", "internal_size", "precision", "scale", "nullable", "type_code", NULL);
 	rb_sFbIndex = rb_struct_define("FbIndex", "table_name", "index_name", "unique", "descending", "columns", NULL);

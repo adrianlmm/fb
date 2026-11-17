@@ -92,4 +92,18 @@ else
   libs.find {|lib| have_library(lib, test_func) }
 end
 
+# Firebird 4+ batch API: si el cliente expone el header y los simbolos de
+# IBatch, fb.c compila el camino de batch (si no, usa el loop de siempre).
+if have_header("firebird/fb_c_api.h")
+  have_func("fb_get_master_interface", "firebird/fb_c_api.h")
+  have_func("fb_get_statement_interface", "firebird/fb_c_api.h")
+  have_func("fb_get_transaction_interface", "firebird/fb_c_api.h")
+end
+
+# Timeout de sentencia y cancelacion de operaciones (Firebird 3+), y la
+# liberacion del GVL necesaria para poder cancelar desde otro hilo.
+have_func("fb_dsql_set_timeout", "ibase.h")
+have_func("fb_cancel_operation", "ibase.h")
+have_func("rb_thread_call_without_gvl", "ruby/thread.h")
+
 create_makefile("fb")
